@@ -827,6 +827,10 @@ class KVMEngine:
     def on_display_change(self) -> None:
         if not self.enabled or self.platform is None:
             return
+        try:
+            self.platform.invalidate_layout()
+        except Exception:
+            pass
         for ch in list(self._channels.values()):
             self._send_screen_info(ch)
 
