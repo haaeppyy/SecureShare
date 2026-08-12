@@ -88,9 +88,14 @@ class Discovery:
         self._peers: dict[str, Peer] = {}
         self._pending: dict[str, int] = {}  # service name -> failed attempts
         self._stop = threading.Event()
-        self._resolver: threading.Thread | None = None
+        self._resolve_thread: threading.Thread | None = None
 
     def start(self) -> None:
+        if self._resolve_thread is not None and self._resolve_thread.is_alive():
+            raise RuntimeError(
+                "Discovery.start() called while the resolve thread is still "
+                "running; call stop() first"
+            )
         self._stop.clear()
         service_name = f"{sanitize(self.name)}-{self.fingerprint[:8]}.{SERVICE_TYPE}"
         self._info = ServiceInfo(
@@ -128,6 +133,14 @@ class Discovery:
             pass
         self._zc = None
         self._browser = None
+        if self._resolve_thread is not None:
+            self._resolve_thread.join(timeout=2.0)
+            if self._resolve_thread.is_alive():
+                print(
+                    "[discovery] resolve thread did not exit within timeout",
+                    flush=True,
+                )
+            self._resolve_thread = None
 
     # -- zeroconf events (must stay light: never call get_service_info here) --
 

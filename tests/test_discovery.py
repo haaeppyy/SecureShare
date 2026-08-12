@@ -4,6 +4,8 @@ propagate multicast between two instances on one host."""
 
 import time
 
+import pytest
+
 from core.discovery import Discovery
 
 
@@ -76,6 +78,36 @@ def test_sanitize():
     assert sanitize("My Mac Book") == "My-Mac-Book"
     assert sanitize("a/b\\c:d") == "a-b-c-d"
     assert sanitize("!!!") == "device"
+
+
+def test_discovery_double_start_raises(tmp_path):
+    """Regression: __init__ stored _resolver but start() assigned a different
+    attribute (_resolve_thread), so a second start() orphaned the first
+    resolve loop with nothing able to stop it."""
+    d = Discovery("Alpha", "AAAA1111-0000-0000-0000-000000000001", 49704)
+    d.start()
+    try:
+        with pytest.raises(RuntimeError):
+            d.start()
+    finally:
+        d.stop()
+
+
+def test_discovery_stop_joins_resolve_thread(tmp_path):
+    """stop() must join the resolve thread and reset the attribute so a
+    start/stop/start cycle never accumulates threads."""
+    d = Discovery("Alpha", "AAAA1111-0000-0000-0000-000000000001", 49705)
+    d.start()
+    t1 = d._resolve_thread
+    assert t1 is not None and t1.is_alive()
+    d.stop()
+    assert not t1.is_alive()
+    assert d._resolve_thread is None
+    d.start()
+    t2 = d._resolve_thread
+    assert t2 is not None and t2 is not t1
+    d.stop()
+    assert not t2.is_alive()
 
 
 class _FakeInfo:
