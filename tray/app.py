@@ -1,0 +1,952 @@
+"""SecureShare tray application.
+
+Runs a pystray icon with tkinter dialogs. The design constraint is that
+tkinter wants its root on the main thread while pystray can run detached,
+so every UI action (menu click, pairing session, transfer completion) is
+posted to a queue that the main thread drains inside its idle loop. The
+Node itself lives on a background thread.
+
+Layout of a busy node:
+    main thread: tk root (hidden) + pystray Icon.run_detached()
+    worker:      Node (discovery, transfer server, sync watchers)
+"""
+
+import argparse
+import os
+import queue
+import sys
+import threading
+import time
+from functools import partial
+
+import pystray
+from PIL import Image, ImageDraw
+
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.node import Node
+from core.transfer import default_download_dir
+
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "tray.png")
+
+
+def default_icon():
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([8, 8, 56, 56], radius=14, fill=(41, 98, 255, 255))
+    d.ellipse([22, 18, 42, 38], fill=(255, 255, 255, 255))
+    d.polygon([(22, 38), (32, 52), (42, 38)], fill=(255, 255, 255, 255))
+    return img
+
+
+def load_icon():
+    try:
+        return Image.open(ICON_PATH)
+    except OSError:
+        return default_icon()
+
+
+class TrayApp:
+    def __init__(self, name=None, data_dir=None, download_dir=None, port=None):
+        self.name = name or None
+        self.data_dir = data_dir
+        self.download_dir = download_dir or default_download_dir()
+        self.port = port
+        self.node = None
+        self.icon = None
+        self.root = None
+        self._queue = queue.Queue()
+        self._sessions = {}
+        self._session_ts = {}
+        self._pair_dialogs = {}
+        self._last_menu_refresh = 0.0
+        self._menu_sig = None
+        self._last_toast_text = None
+        self._last_toast_slot = -1
+        self._stopping = False
+        self._transfers = {}
+        self._last_tx_post = {}
+        self._transfer_window = None
+        self._transfer_rows = {}
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def run(self):
+        from core.transfer import DEFAULT_PORT
+
+        self.node = Node(
+            name=self.name,
+            data_dir=self.data_dir,
+            download_dir=self.download_dir,
+            port=self.port or DEFAULT_PORT,
+            on_status=lambda s: self.post(self._toast, s),
+            on_incoming_pair=lambda s: self.post(self._handle_session, s),
+            on_transfer_start=lambda i: self.post(
+                self._tx_start, "recv", i["fingerprint"], i["from"], i["name"], i["size"]
+            ),
+            on_transfer_progress=lambda i, r, t: self._post_progress(
+                f"recv:{i['fingerprint']}:{i['name']}", r, t
+            ),
+            on_transfer_complete=lambda i: self.post(self._tx_recv_done, i),
+            log=lambda m: self.post(self._log, m),
+        )
+        self.node.start()
+
+        import tkinter as tk
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
+
+        icon_options = {}
+        if sys.platform == "darwin":
+            # Integrate pystray into Tk's NSApplication: the Tk mainloop below
+            # is what pumps AppKit events (pystray run_detached on macOS does
+            # not run its own loop).
+            try:
+                from AppKit import NSApplication
+
+                icon_options["darwin_nsapplication"] = NSApplication.sharedApplication()
+            except Exception:
+                pass
+
+        self.icon = pystray.Icon(
+            "SecureShare",
+            load_icon(),
+            "SecureShare",
+            menu=self._build_menu(),
+            **icon_options,
+        )
+        self.icon.run_detached()
+        self.post(self._toast, f"SecureShare running as {self.node.store.identity['name']}")
+        self._pump()
+
+    def _quit(self):
+        if self._stopping:
+            return
+        self._stopping = True
+        try:
+            self.icon.stop()
+        except Exception:
+            pass
+        for session in list(self._sessions.values()):
+            try:
+                session.close()
+            except Exception:
+                pass
+        for fp in list(self._pair_dialogs):
+            self._close_pair_dialog(fp)
+        try:
+            self.node.stop()
+        except Exception:
+            pass
+        self._close_transfer_window()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    # -- main-thread queue pump ----------------------------------------------
+
+    def post(self, fn, *args):
+        self._queue.put((fn, args))
+
+    def _pump(self):
+        while not self._stopping:
+            try:
+                fn, args = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                self._refresh_menu_if_stale()
+                if self.root:
+                    self.root.update_idletasks()
+                    self.root.update()
+                continue
+            try:
+                fn(*args)
+            except Exception as exc:
+                self._toast(f"error: {exc}")
+            if self.root:
+                try:
+                    self.root.update_idletasks()
+                    self.root.update()
+                except Exception:
+                    break
+
+    # -- UI helpers (main thread only) ---------------------------------------
+
+    def _toast(self, message: str):
+        now = time.monotonic()
+        if (message, now // 3) == (self._last_toast_text, self._last_toast_slot):
+            return
+        self._last_toast_text = message
+        self._last_toast_slot = now // 3
+        try:
+            self.icon.notify(str(message), "SecureShare")
+        except Exception:
+            pass
+
+    def _log(self, message: str):
+        self._toast(message)
+
+    def _refresh_menu_if_stale(self):
+        now = time.monotonic()
+        if now - self._last_menu_refresh < 2.0:
+            return
+        self._last_menu_refresh = now
+        try:
+            peers = self._safe_peers()
+            self._prune_stale_transfers(now)
+            sig = (
+                len(peers),
+                tuple((p.fingerprint, p.host, p.port) for p in peers),
+                len([s for s in self._sessions.values() if self._session_actionable(s)]),
+                self._sync_enabled(),
+                self._kvm_enabled(),
+                tuple(
+                    (p["fingerprint"], p.get("kvm_allowed", False), p.get("kvm_side", "right"))
+                    for p in self._kvm_peers()
+                ),
+                tuple(
+                    (p["fingerprint"], self._peer_kvm_status(p["fingerprint"]))
+                    for p in self._kvm_peers()
+                ),
+                tuple(
+                    (tid, min(100, int(entry["received"] * 100 / (entry["total"] or 1))) // 5)
+                    for tid, entry in sorted(self._transfers.items())
+                ),
+            )
+        except Exception:
+            return
+        if sig == self._menu_sig:
+            return
+        self._menu_sig = sig
+        try:
+            self.icon.menu = self._build_menu()
+            if os.environ.get("SECURESHARE_DEBUG"):
+                print(
+                    f"[menu] refreshed ok: peers={len(peers)} sync={self._sync_enabled()!r}",
+                    flush=True,
+                )
+        except Exception:
+            print("[menu] refresh FAILED", flush=True)
+            if os.environ.get("SECURESHARE_DEBUG"):
+                import traceback
+
+                traceback.print_exc()
+
+    # -- pairing -------------------------------------------------------------
+
+    def _handle_session(self, session):
+        if session.state == "denied" or session.error or not session.insession:
+            self._toast(f"Pairing with {session.peer_name} failed: {session.error or 'denied'}")
+            return
+        old = self._sessions.get(session.peer_fp)
+        if old is not None and old is not session:
+            try:
+                old.close()
+            except Exception:
+                pass
+        self._sessions[session.peer_fp] = session
+        self._session_ts[session.peer_fp] = time.monotonic()
+        self._toast(f"Pairing with {session.peer_name} - PIN: {session.pin}")
+        self._show_pair_dialog(session)
+
+    # -- pairing popups -------------------------------------------------------
+
+    def _show_pair_dialog(self, session):
+        """Pop up the pairing request / PIN confirmation window.
+
+        Responder side shows Accept/Deny (the request to connect); the
+        initiator side shows Confirm/Deny for the PIN match. Both sides
+        must act: the responder Accepts, the initiator Confirms, and only
+        then is trust stored.
+        """
+        if session.state in ("done", "denied") or session.error or not session.insession:
+            return
+        self._close_pair_dialog(session.peer_fp)
+        import tkinter as tk
+
+        self._prepare_dialog()
+        win = tk.Toplevel(self.root)
+        win.title("SecureShare - Pairing")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_pair_dialog(session.peer_fp))
+        if session.role == "initiator":
+            title = f"Pairing with {session.peer_name}"
+        else:
+            title = f"Pairing from {session.peer_name}"
+        tk.Label(win, text=title, font=("", 12, "bold")).pack(padx=28, pady=(16, 4))
+        tk.Label(
+            win,
+            text=f"PIN: {session.pin}  -  check it matches on both screens",
+            font=("", 11),
+        ).pack(padx=28, pady=4)
+        buttons = tk.Frame(win)
+        buttons.pack(pady=(8, 16))
+        if session.role == "initiator":
+            tk.Button(
+                buttons,
+                text="Confirm",
+                width=12,
+                command=lambda: self._pair_dialog_action(session, "confirm"),
+            ).pack(side="left", padx=6)
+        else:
+            tk.Button(
+                buttons,
+                text="Accept",
+                width=12,
+                command=lambda: self._pair_dialog_action(session, "accept"),
+            ).pack(side="left", padx=6)
+        tk.Button(
+            buttons,
+            text="Deny",
+            width=12,
+            command=lambda: self._pair_dialog_action(session, "deny"),
+        ).pack(side="left", padx=6)
+        self._pair_dialogs[session.peer_fp] = win
+
+    def _pair_dialog_action(self, session, action):
+        self._session_action(session, action)
+        self._close_pair_dialog(session.peer_fp)
+        if action == "accept":
+            self._toast(f"Waiting for {session.peer_name} to confirm the PIN...")
+        elif action == "confirm":
+            self._toast(f"Paired with {session.peer_name}")
+        elif action == "deny":
+            self._toast(f"Pairing with {session.peer_name} denied")
+
+    def _close_pair_dialog(self, fingerprint):
+        win = self._pair_dialogs.pop(fingerprint, None)
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _prune_sessions(self):
+        now = time.monotonic()
+        for fp, session in list(self._sessions.items()):
+            if session.state in ("done", "denied") or session.error:
+                del self._sessions[fp]
+                self._session_ts.pop(fp, None)
+                self._close_pair_dialog(fp)
+            elif now - self._session_ts.get(fp, now) > 70.0:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                del self._sessions[fp]
+                self._session_ts.pop(fp, None)
+                self._close_pair_dialog(fp)
+
+    def _session_actionable(self, session):
+        if session.error or not session.insession:
+            return False
+        if session.role == "initiator":
+            return session.state == "awaiting_confirm"
+        return session.state == "pending"
+
+    def _session_action(self, session, action):
+        try:
+            if action == "accept":
+                session.accept()
+            elif action == "confirm":
+                session.confirm(True)
+            else:
+                session.deny()
+        except Exception as exc:
+            self._toast(f"pairing error: {exc}")
+
+    # -- transfers -----------------------------------------------------------
+
+    TX_POST_INTERVAL = 0.2
+    TX_STALE_AFTER = 30.0
+
+    def _post_progress(self, tid, received, total):
+        """Background-thread safe: throttles progress posts per transfer so
+        the ~1 MiB chunk firehose does not flood the UI queue."""
+        now = time.monotonic()
+        last = self._last_tx_post.get(tid)
+        if last is not None and now - last < self.TX_POST_INTERVAL and received < total:
+            return
+        self._last_tx_post[tid] = now
+        self.post(self._tx_progress, tid, received, total)
+
+    def _tx_start(self, direction, peer_fp, peer_name, name, total):
+        tid = f"{direction}:{peer_fp}:{name}"
+        if tid in self._transfers:
+            return
+        now = time.monotonic()
+        self._transfers[tid] = {
+            "direction": direction,
+            "peer": peer_name,
+            "name": name,
+            "received": 0,
+            "total": total,
+            "started": now,
+            "last": now,
+        }
+        self._ensure_transfer_window()
+        self._rebuild_window_rows()
+
+    def _tx_progress(self, tid, received, total):
+        entry = self._transfers.get(tid)
+        if entry is None:
+            return
+        if total is not None:
+            entry["total"] = total
+        entry["received"] = received
+        entry["last"] = time.monotonic()
+        if self._transfer_window is not None:
+            try:
+                if self._transfer_window.winfo_exists():
+                    self._update_window_rows()
+            except Exception:
+                pass
+
+    def _tx_done(self, tid):
+        self._transfers.pop(tid, None)
+        self._last_tx_post.pop(tid, None)
+        if not self._transfers:
+            self._close_transfer_window()
+
+    def _tx_recv_done(self, info):
+        self._tx_done(f"recv:{info['fingerprint']}:{info['name']}")
+        self._toast(f"Received {info['name']} -> {info['path']}")
+
+    def _prune_stale_transfers(self, now):
+        for tid, entry in list(self._transfers.items()):
+            if now - entry["last"] > self.TX_STALE_AFTER:
+                del self._transfers[tid]
+                self._last_tx_post.pop(tid, None)
+        if not self._transfers:
+            self._close_transfer_window()
+
+    # -- transfer progress window -------------------------------------------
+
+    def _ensure_transfer_window(self):
+        if self._transfer_window is not None:
+            try:
+                if self._transfer_window.winfo_exists():
+                    return
+            except Exception:
+                pass
+        import tkinter as tk
+
+        self._prepare_dialog()
+        win = tk.Toplevel(self.root)
+        win.title("SecureShare Transfers")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._hide_transfer_window)
+        self._transfer_window = win
+        self._transfer_rows = {}
+        self._rebuild_window_rows()
+
+    def _hide_transfer_window(self):
+        try:
+            self._transfer_window.withdraw()
+        except Exception:
+            pass
+
+    def _close_transfer_window(self):
+        if self._transfer_window is not None:
+            try:
+                self._transfer_window.destroy()
+            except Exception:
+                pass
+        self._transfer_window = None
+        self._transfer_rows = {}
+
+    def _rebuild_window_rows(self):
+        win = self._transfer_window
+        if win is None:
+            return
+        import tkinter as tk
+        from tkinter import ttk
+
+        for child in win.winfo_children():
+            child.destroy()
+        self._transfer_rows = {}
+        for tid, entry in sorted(self._transfers.items()):
+            frame = tk.Frame(win)
+            frame.pack(fill="x", padx=10, pady=6)
+            arrow = "↑" if entry["direction"] == "send" else "↓"
+            tk.Label(frame, text=f"{arrow} {entry['name']}  ->  {entry['peer']}", anchor="w").pack(
+                fill="x"
+            )
+            bar = ttk.Progressbar(frame, maximum=entry["total"] or 1, value=0)
+            bar.pack(fill="x", pady=2)
+            status = tk.Label(frame, text="", anchor="w")
+            status.pack(fill="x")
+            self._transfer_rows[tid] = {"bar": bar, "status": status}
+        self._update_window_rows()
+
+    def _update_window_rows(self):
+        for tid, entry in sorted(self._transfers.items()):
+            row = self._transfer_rows.get(tid)
+            if row is None:
+                self._rebuild_window_rows()
+                return
+            total = entry["total"]
+            if not total:
+                continue
+            row["bar"].configure(maximum=total, value=entry["received"])
+            pct = min(100.0, entry["received"] * 100.0 / total)
+            elapsed = max(0.001, entry["last"] - entry["started"])
+            rate = entry["received"] / elapsed
+            rem = total - entry["received"]
+            eta = rem / rate if rate > 0 else 0.0
+            row["status"].configure(
+                text=f"{pct:.0f}%  \u00b7  {rate / 1048576:.1f} MB/s  \u00b7  ETA {eta:.0f}s"
+            )
+
+    # -- menu ----------------------------------------------------------------
+
+    def _build_menu(self):
+        self._prune_sessions()
+        items = [
+            pystray.MenuItem(lambda item: f"Name: {self._node_name()}", None, enabled=False),
+            pystray.MenuItem(lambda item: f"Status: {self._status()}", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+        ]
+        transfer_items = self._transfer_items()
+        if transfer_items:
+            items.append(pystray.MenuItem("Transfers", None, enabled=False))
+            items.extend(transfer_items)
+            items.append(pystray.Menu.SEPARATOR)
+        active = sorted(
+            (s for s in self._sessions.values() if self._session_actionable(s)),
+            key=lambda s: s.peer_name.lower(),
+        )
+        if active:
+            for session in active:
+                items.append(self._pairing_submenu(session))
+            items.append(pystray.Menu.SEPARATOR)
+
+        peers = self._safe_peers()
+
+        if peers:
+            items.append(self._pair_submenu(peers))
+            items.append(self._send_submenu(peers))
+            items.append(self._unpair_submenu())
+        else:
+            items.append(pystray.MenuItem("No devices currently online", None, enabled=False))
+
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(
+            pystray.MenuItem(
+                lambda item: "Clipboard sync: ON" if self._sync_enabled() else "Clipboard sync: OFF",
+                lambda icon, item: self.post(self._toggle_sync),
+                checked=lambda item: self._sync_enabled(),
+            )
+        )
+        # This is deliberately a direct menu switch. On macOS a submenu is
+        # visually indistinguishable from a setting until it has been opened.
+        items.append(
+            pystray.MenuItem(
+                lambda item: self._kvm_switch_label(),
+                partial(self._toggle_kvm),
+                checked=lambda item: self._kvm_enabled(),
+            )
+        )
+        items.append(self._kvm_setup_submenu())
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("Open download folder", self._open_downloads))
+        items.append(pystray.MenuItem("Quit", self._quit))
+        return pystray.Menu(*items)
+
+    def _pairing_submenu(self, session):
+        if session.role == "initiator":
+            label = f"Pairing with {session.peer_name}"
+            confirm = pystray.MenuItem(
+                "Confirm",
+                lambda icon, item: self.post(self._session_action, session, "confirm"),
+            )
+        else:
+            label = f"Pairing from {session.peer_name}"
+            confirm = pystray.MenuItem(
+                "Accept",
+                lambda icon, item: self.post(self._session_action, session, "accept"),
+            )
+        return pystray.MenuItem(
+            label,
+            pystray.Menu(
+                pystray.MenuItem(f"PIN: {session.pin}", None, enabled=False),
+                confirm,
+                pystray.MenuItem(
+                    "Deny",
+                    lambda icon, item: self.post(self._session_action, session, "deny"),
+                ),
+            ),
+        )
+
+    def _transfer_items(self):
+        items = []
+        for tid, entry in sorted(self._transfers.items()):
+            total = entry["total"] or 1
+            pct = min(100, int(entry["received"] * 100 / total))
+            arrow = "↑" if entry["direction"] == "send" else "↓"
+            filled = round(pct / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            items.append(
+                pystray.MenuItem(
+                    f"{arrow} {entry['name']} {pct}% [{bar}]",
+                    None,
+                    enabled=False,
+                )
+            )
+        return items
+
+    def _node_name(self):
+        try:
+            return self.node.store.identity["name"]
+        except Exception:
+            return "SecureShare"
+
+    def _safe_peers(self):
+        try:
+            return sorted(
+                self.node.discovery.peers().values(), key=lambda p: (p.name or "").lower()
+            )
+        except Exception:
+            return []
+
+    def _status(self):
+        try:
+            peers = len(self.node.discovery.peers())
+            paired = len(self.node.store.list_peers())
+            if peers == 0:
+                return f"No devices online · {paired} paired saved"
+            return f"{peers} device(s) online · {paired} paired saved"
+        except Exception:
+            return "starting..."
+
+    def _sync_enabled(self):
+        try:
+            return bool(self.node.store.sync_enabled)
+        except Exception:
+            return False
+
+    # -- keyboard & mouse sharing (KVM) --------------------------------------
+
+    def _kvm_enabled(self):
+        try:
+            return bool(self.node.kvm.enabled)
+        except Exception:
+            return False
+
+    def _kvm_switch_label(self):
+        """Feature state, never a claim that a peer is connected."""
+        try:
+            online = len(self.node.discovery.peers())
+        except Exception:
+            online = 0
+        state = "ON" if self._kvm_enabled() else "OFF"
+        suffix = " · no device online" if online == 0 else ""
+        return f"Mouse & keyboard sharing: {state}{suffix}"
+
+    def _kvm_peers(self):
+        try:
+            return sorted(self.node.store.list_peers(), key=lambda p: (p["name"] or "").lower())
+        except Exception:
+            return []
+
+    def _toggle_kvm(self, icon=None, item=None):
+        try:
+            before = self._kvm_enabled()
+            self.node.kvm.set_enabled(not before)
+            if os.environ.get("SECURESHARE_DEBUG"):
+                print(
+                    f"[menu] toggle kvm {before} -> {not before} "
+                    f"(engine={self.node.kvm.enabled!r}, store={self.node.store.kvm_enabled!r})",
+                    flush=True,
+                )
+        except Exception as exc:
+            self._toast(f"kvm error: {exc}")
+
+    def _toggle_kvm_allowed(self, fingerprint, icon=None, item=None):
+        self._set_kvm_allowed(fingerprint, not self._peer_kvm_allowed(fingerprint))
+
+    def _set_kvm_allowed(self, fingerprint, allowed, icon=None, item=None):
+        try:
+            self.node.store.set_peer_kvm_allowed(fingerprint, allowed)
+        except Exception as exc:
+            self._toast(f"kvm error: {exc}")
+
+    def _set_kvm_side(self, fingerprint, side, icon=None, item=None):
+        try:
+            self.node.store.set_peer_kvm_side(fingerprint, side)
+        except Exception as exc:
+            self._toast(f"kvm error: {exc}")
+
+    def _kvm_setup_submenu(self):
+        peers = self._kvm_peers()
+        if not peers:
+            peers_label = [pystray.MenuItem("No paired devices", None, enabled=False)]
+        else:
+            peers_label = []
+        peer_items = []
+        for peer in peers:
+            fp = peer["fingerprint"]
+            status = self._peer_kvm_status(fp)
+            side_items = []
+            for label, value in (
+                ("Left", "left"),
+                ("Right", "right"),
+                ("Top", "top"),
+                ("Bottom", "bottom"),
+            ):
+                side_items.append(
+                    pystray.MenuItem(
+                        label,
+                        partial(self._set_kvm_side, fp, value),
+                        radio=True,
+                        checked=partial(self._peer_kvm_side, fp, value),
+                    )
+                )
+            peer_items.append(
+                pystray.MenuItem(
+                    peer["name"] or peer["fingerprint"][:8],
+                    pystray.Menu(
+                        pystray.MenuItem(
+                            f"KVM status: {status}",
+                            None,
+                            enabled=False,
+                        ),
+                        pystray.Menu.SEPARATOR,
+                        pystray.MenuItem(
+                            "Allow this device to control this Mac",
+                            partial(self._toggle_kvm_allowed, fp),
+                            checked=partial(self._peer_kvm_allowed, fp),
+                        ),
+                        pystray.Menu.SEPARATOR,
+                        pystray.MenuItem("This device is on this side of this Mac", None, enabled=False),
+                        *side_items,
+                    ),
+                )
+            )
+        return pystray.MenuItem(
+            lambda item: f"Mouse & keyboard devices… ({len(peers)} paired)",
+            pystray.Menu(
+                pystray.MenuItem("Move across a selected screen edge to control it", None, enabled=False),
+                *peers_label,
+                *peer_items,
+            ),
+        )
+
+    def _peer_kvm_status(self, fp, item=None):
+        """Per-peer KVM state. Link and control are separate on purpose."""
+        try:
+            link = self.node.kvm.link_status(fp)
+            control = self.node.kvm.control_state(fp)
+        except Exception:
+            link = "offline"
+            control = "local"
+        if self._kvm_enabled() is False:
+            return "off"
+        if control == "controlling":
+            return "controlling"
+        if control == "remote":
+            return "controlled by peer"
+        if control in ("requesting", "remote_preparing", "reverting"):
+            return control.replace("_", " ")
+        if link == "error":
+            return "error"
+        if link == "ready":
+            return "ready"
+        if link == "linked":
+            return "linked"
+        if link == "connecting":
+            return "connecting"
+        return "offline"
+
+    def _peer_kvm_allowed(self, fp, item=None):
+        try:
+            return bool(self.node.store.get_peer(fp).get("kvm_allowed", False))
+        except Exception:
+            return False
+
+    def _peer_kvm_not_allowed(self, fp, item=None):
+        return not self._peer_kvm_allowed(fp)
+
+    def _peer_kvm_side(self, fp, value, item=None):
+        try:
+            return self.node.store.get_peer(fp).get("kvm_side", "right") == value
+        except Exception:
+            return False
+
+    def _toggle_sync(self):
+        try:
+            before = self._sync_enabled()
+            self.node.sync.set_enabled(not before)
+            if os.environ.get("SECURESHARE_DEBUG"):
+                print(
+                    f"[menu] toggle sync {before} -> {not before} "
+                    f"(store={self.node.store.sync_enabled!r})",
+                    flush=True,
+                )
+        except Exception as exc:
+            import traceback
+
+            traceback.print_exc()
+            self._toast(f"sync error: {exc}")
+
+    def _pair_submenu(self, peers):
+        def make_item(peer):
+            return pystray.MenuItem(
+                peer.name or peer.fingerprint[:8],
+                lambda icon, item: self.post(self._start_pairing, peer),
+            )
+
+        items = [
+            make_item(p)
+            for p in peers
+            if not self.node.store.is_paired(p.fingerprint)
+        ]
+        if not items:
+            items = [pystray.MenuItem("All devices paired", None, enabled=False)]
+        return pystray.MenuItem("Pair with device", pystray.Menu(*items))
+
+    def _send_submenu(self, peers):
+        def make_item(peer):
+            return pystray.MenuItem(
+                peer.name or peer.fingerprint[:8],
+                lambda icon, item: self.post(self._pick_and_send, peer),
+            )
+
+        items = [
+            make_item(p) for p in peers if self.node.store.is_paired(p.fingerprint)
+        ]
+        if not items:
+            items = [pystray.MenuItem("No paired devices", None, enabled=False)]
+        return pystray.MenuItem("Send file to", pystray.Menu(*items))
+
+    def _unpair_submenu(self):
+        def make_item(peer):
+            return pystray.MenuItem(
+                f"{peer['name']} ({peer['fingerprint'][:8]})",
+                lambda icon, item: self.post(self._unpair, peer["fingerprint"]),
+            )
+
+        items = [make_item(p) for p in self.node.store.list_peers()]
+        if not items:
+            items = [pystray.MenuItem("No paired devices", None, enabled=False)]
+        return pystray.MenuItem("Unpair device", pystray.Menu(*items))
+
+    def _open_downloads(self, icon=None, item=None):
+        import subprocess
+
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", self.download_dir])
+            elif sys.platform == "win32":
+                os.startfile(self.download_dir)
+        except Exception as exc:
+            self._toast(f"cannot open downloads: {exc}")
+
+    # -- actions (main thread; heavy work offloaded to threads) --------------
+
+    def _start_pairing(self, peer):
+        if any(s.peer_fp == peer.fingerprint for s in self._sessions.values()):
+            self._toast("Pairing already in progress with this device")
+            return
+
+        def worker():
+            try:
+                # pair_with posts the session through on_session -> the UI
+                # already handles it (menu entry); nothing more to do here.
+                self.node.pair_with(peer.host, peer.port)
+            except Exception as exc:
+                self.post(self._toast, f"pairing failed: {exc}")
+
+        threading.Thread(target=worker, name="pair-init", daemon=True).start()
+
+    def _prepare_dialog(self):
+        """Put the hidden root on-screen so native dialogs (file picker,
+        message boxes) never open clipped or off-screen."""
+        try:
+            w = self.root.winfo_screenwidth()
+            h = self.root.winfo_screenheight()
+            self.root.geometry(f"+{max(0, w // 2 - 250)}+{max(0, h // 4)}")
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+    def _pick_and_send(self, peer):
+        from tkinter import filedialog
+
+        self._prepare_dialog()
+        path = filedialog.askopenfilename(
+            parent=None if sys.platform == "darwin" else self.root,
+            title=f"Send to {peer.name}",
+        )
+        if not path:
+            return
+        self._send_to(peer, path)
+
+    def _send_to(self, peer, path):
+        name = os.path.basename(path)
+        tid = f"send:{peer.fingerprint}:{name}"
+
+        def worker():
+            self.post(
+                self._tx_start,
+                "send",
+                peer.fingerprint,
+                peer.name or peer.fingerprint[:8],
+                name,
+                None,
+            )
+            try:
+                result = self.node.send_file(
+                    peer.fingerprint, path, on_progress=self._post_progress_for(tid)
+                )
+                self.post(self._tx_done, tid)
+                self.post(
+                    self._toast,
+                    f"Sent {name} ({result['bytes']} B, "
+                    f"{result['mbps']:.0f} MB/s)",
+                )
+            except Exception as exc:
+                self.post(self._tx_done, tid)
+                self.post(self._toast, f"send failed: {exc}")
+
+        threading.Thread(target=worker, name="send-file", daemon=True).start()
+
+    def _post_progress_for(self, tid):
+        def progress(sent, total):
+            self._post_progress(tid, sent, total)
+
+        return progress
+
+    def _unpair(self, fingerprint: str):
+        from tkinter import messagebox
+
+        peer = self.node.store.get_peer(fingerprint)
+        name = peer["name"] if peer else fingerprint[:8]
+        self._prepare_dialog()
+        if messagebox.askyesno("SecureShare", f"Unpair {name}?"):
+            self.node.store.remove_peer(fingerprint)
+            self._toast(f"Unpaired {name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SecureShare tray app")
+    parser.add_argument("--name", help="device name shown to peers")
+    parser.add_argument("--data-dir", help="where trust data is stored")
+    parser.add_argument("--download-dir", help="where received files go")
+    parser.add_argument("--port", type=int, help="transfer listener port")
+    args = parser.parse_args()
+    TrayApp(
+        name=args.name,
+        data_dir=args.data_dir,
+        download_dir=args.download_dir,
+        port=args.port,
+    ).run()
+
+
+if __name__ == "__main__":
+    main()

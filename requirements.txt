@@ -1,0 +1,22 @@
+# Core
+cryptography>=42.0
+zeroconf>=0.132
+
+# UI
+pystray>=0.19.5
+Pillow>=10.0
+
+# Clipboard text
+pyperclip>=1.8
+
+# Trust store encryption at rest
+keyring>=24.0
+
+# macOS clipboard images (NSPasteboard) and tray integration
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+
+# Windows clipboard images and tray
+pywin32>=306; sys_platform == "win32"
+
+# Packaging
+pyinstaller>=6.0
