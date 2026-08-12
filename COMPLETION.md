@@ -9,7 +9,7 @@ directory `Cyber-Project-main` is untouched.
 
 | Item | Location |
 |---|---|
-| Source | `~/Documents/secure-share/` |
+| Source | repository root (this directory) |
 | macOS app bundle | `dist/SecureShare.app` (43 MB, arm64, built on this Mac) |
 | macOS zip | `dist/SecureShare-macOS-arm64.zip` (70 MB) |
 | Windows build recipe | `secure-share-win.spec` (build on Windows) |
