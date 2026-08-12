@@ -1,9 +1,6 @@
 # SecureShare — completion report
 
-Rebuilt the legacy `Cyber-Project` codebase as **secure-share**: a LAN-only,
-end-to-end encrypted file transfer + clipboard sync tray app for macOS and
-Windows. The old project (MySQL credential store, web UI) is retired; the
-directory `Cyber-Project-main` is untouched.
+**SecureShare** is a LAN-only, end-to-end encrypted file transfer + clipboard sync + KVM sharing tray app for macOS and Windows, built from scratch with no legacy dependencies.
 
 ## Deliverables
 

@@ -5,10 +5,6 @@ menu-bar / tray app. No accounts, no cloud, no Internet — devices find each
 other on the local network and are trusted only after a PIN handshake you
 verify out of band.
 
-> Replaces the legacy `Cyber-Project` codebase. That project's MySQL-based
-> credential store and PHP-style web UI are retired; nothing is imported
-> from it.
-
 ## Features
 
 - **Pairing with PIN verification** — ECDH (P-256) key exchange over TCP,
@@ -153,4 +149,3 @@ right-click → Open.
 - KVM supports the standard 104-key US set; media keys, IME and dead keys
   are not forwarded. The seam is computed against the union bounds of all
   monitors (exact for single-monitor setups; multi-monitor layouts are v2).
-- Legacy `Cyber-Project-main` stays untouched in the parent directory.
