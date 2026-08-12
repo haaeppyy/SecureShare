@@ -26,7 +26,7 @@ import os
 import threading
 import time
 
-from .kvm_geometry import Monitor, ScreenLayout, in_jump_zone
+from .kvm_geometry import Monitor, ScreenLayout, ScreenLayoutCache, in_jump_zone
 
 SENTINEL = 0x5E4C0DE5
 
@@ -79,6 +79,8 @@ class MacInputPlatform:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._callback_ref = None
+        self._reconfig_cb = None
+        self._layout_cache = ScreenLayoutCache(self._layout_uncached)
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -90,10 +92,12 @@ class MacInputPlatform:
         self.engine = engine
         self._stop.clear()
         self._callback_ref = self._make_callback()
+        self._register_display_callbacks()
         self._tap_thread = threading.Thread(target=self._tap_main, name="kvm-tap", daemon=True)
         self._tap_thread.start()
 
     def stop(self) -> None:
+        self._unregister_display_callbacks()
         self._stop.set()
         with self._lock:
             rl = self._tap_runloop
@@ -312,6 +316,12 @@ class MacInputPlatform:
     # -- geometry ---------------------------------------------------------------
 
     def screen_layout(self) -> ScreenLayout:
+        return self._layout_cache.get()
+
+    def invalidate_layout(self) -> None:
+        self._layout_cache.invalidate()
+
+    def _layout_uncached(self) -> ScreenLayout:
         if NSScreen is None:
             raise MacPlatformError("AppKit unavailable")
         monitors = []
@@ -327,6 +337,37 @@ class MacInputPlatform:
                 )
             )
         return ScreenLayout(monitors, primary=0)
+
+    # -- display-change notifications -------------------------------------------
+
+    def _register_display_callbacks(self) -> None:
+        if not _QUARTZ_OK:
+            return
+        try:
+
+            def reconfig(display, flags, userinfo):
+                self._layout_cache.invalidate()
+                if self.engine is not None:
+                    try:
+                        self.engine.on_display_change()
+                    except Exception:
+                        pass
+
+            # Keep a reference so pyobjc does not collect the callback.
+            self._reconfig_cb = reconfig
+            Quartz.CGDisplayRegisterReconfigurationCallback(reconfig, None)
+        except Exception:
+            self._reconfig_cb = None
+
+    def _unregister_display_callbacks(self) -> None:
+        cb = self._reconfig_cb
+        self._reconfig_cb = None
+        if cb is None:
+            return
+        try:
+            Quartz.CGDisplayUnregisterReconfigurationCallback(cb, None)
+        except Exception:
+            pass
 
     def cursor_position(self) -> tuple[int, int]:
         q = _q()

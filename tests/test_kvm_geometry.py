@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from core.kvm_geometry import (
@@ -5,6 +7,7 @@ from core.kvm_geometry import (
     GeometryError,
     Monitor,
     ScreenLayout,
+    ScreenLayoutCache,
     clamp_to_edge,
     in_jump_zone,
     map_to_peer,
@@ -129,5 +132,48 @@ def test_offscreen_monitor_union():
 
 def test_scale_conversion():
     assert pt_to_px(100, 2.0) == 200
+
+
+def test_layout_cache_computes_once():
+    calls = {"n": 0}
+
+    def compute():
+        calls["n"] += 1
+        return layout()
+
+    cache = ScreenLayoutCache(compute, max_age_s=10.0)
+    for _ in range(3):
+        assert cache.get() is cache.get()
+    assert calls["n"] == 1
+
+
+def test_layout_cache_invalidate_recomputes():
+    calls = {"n": 0}
+
+    def compute():
+        calls["n"] += 1
+        return layout()
+
+    cache = ScreenLayoutCache(compute, max_age_s=10.0)
+    cache.get()
+    cache.invalidate()
+    cache.get()
+    assert calls["n"] == 2
+
+
+def test_layout_cache_ttl_expiry():
+    calls = {"n": 0}
+
+    def compute():
+        calls["n"] += 1
+        return layout()
+
+    cache = ScreenLayoutCache(compute, max_age_s=0.05)
+    cache.get()
+    cache.get()
+    assert calls["n"] == 1
+    time.sleep(0.08)
+    cache.get()
+    assert calls["n"] == 2
     assert px_to_pt(200, 2.0) == 100
     assert pt_to_px(0, 1.0) == 0

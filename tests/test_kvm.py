@@ -45,6 +45,9 @@ class FakePlatform:
     def screen_layout(self):
         return ScreenLayout([Monitor(**m) for m in self.monitors], primary=0)
 
+    def invalidate_layout(self):
+        pass
+
     def cursor_position(self):
         return self.cursor
 

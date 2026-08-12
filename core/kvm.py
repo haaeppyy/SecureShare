@@ -175,6 +175,9 @@ class InputPlatform:
     def screen_layout(self) -> ScreenLayout:
         raise NotImplementedError
 
+    def invalidate_layout(self) -> None:
+        """Drop any cached screen layout (display-change signal). Default no-op."""
+
     def cursor_position(self) -> tuple[int, int]:
         raise NotImplementedError
 

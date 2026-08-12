@@ -20,7 +20,7 @@ import ctypes
 import ctypes.wintypes as wt
 import threading
 
-from .kvm_geometry import Monitor, ScreenLayout, in_jump_zone
+from .kvm_geometry import Monitor, ScreenLayout, ScreenLayoutCache, in_jump_zone
 
 SENTINEL = 0x5E4C0DE5
 
@@ -156,6 +156,7 @@ class WindowsInputPlatform:
         self._last_pos = None
         self._pressed = set()
         self._virtual = None  # virtual-desktop pixel bounds (l, t, r, b)
+        self._layout_cache = ScreenLayoutCache(self._layout_uncached)
         if _WIN_OK:
             try:
                 ctypes.windll.user32.SetProcessDPIAware()
@@ -324,6 +325,12 @@ class WindowsInputPlatform:
             self._virtual = (0, 0, 1920, 1080)
 
     def screen_layout(self) -> ScreenLayout:
+        return self._layout_cache.get()
+
+    def invalidate_layout(self) -> None:
+        self._layout_cache.invalidate()
+
+    def _layout_uncached(self) -> ScreenLayout:
         if not _WIN_OK:
             raise WindowsPlatformError("pywin32 unavailable")
         self._refresh_virtual_bounds()
