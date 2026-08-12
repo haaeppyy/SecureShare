@@ -499,3 +499,59 @@ def test_display_change_resyncs(node_pair_ctx):
         lambda: pair.a.kvm._peer_layouts[pair.b.store.fingerprint()].right() == 2560
     )
     assert ok
+
+
+def test_expire_handoff_with_dead_channel_clears_state(node_pair_ctx):
+    """Regression: _expire_handoff with a vanished channel left _state stuck
+    in requesting and the watchdog re-fired the same expiry forever."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    rec = {
+        "id": 123,
+        "role": "controller",
+        "stage": "waiting_ready",
+        "deadline": time.monotonic() - 1,
+        "entry": (4, 540),
+        "mask": 0,
+        "fraction": 0.5,
+        "parked": False,
+    }
+    pair.a.kvm._handoffs[fp_b] = rec
+    pair.a.kvm._state[fp_b] = "requesting"
+    pair.a.kvm._channels.pop(fp_b, None)  # channel is already gone
+    pair.a.kvm._expire_handoff(fp_b, rec)
+    assert pair.a.kvm._state.get(fp_b) is None
+    assert pair.a.kvm._handoffs.get(fp_b) is None
+    assert plat_a.delegation == "local"
+    # a second expiry (the watchdog firing again) must be a no-op
+    pair.a.kvm._expire_handoff(fp_b, rec)
+    assert pair.a.kvm._state.get(fp_b) is None
+
+
+def test_expire_handoff_dead_channel_restores_parked_cursor(node_pair_ctx):
+    """The controller cursor must be restored even when the channel died
+    while the handoff was parked."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    rec = {
+        "id": 124,
+        "role": "controller",
+        "stage": "waiting_active",
+        "deadline": time.monotonic() - 1,
+        "entry": (4, 540),
+        "mask": 0,
+        "fraction": 0.5,
+        "parked": True,
+    }
+    pair.a.kvm._handoffs[fp_b] = rec
+    pair.a.kvm._state[fp_b] = "controlling"
+    pair.a.kvm._channels.pop(fp_b, None)
+    plat_a.cursor_hidden = True
+    pair.a.kvm._expire_handoff(fp_b, rec)
+    assert pair.a.kvm._state.get(fp_b) is None
+    assert plat_a.cursor_hidden is False
+    # restored just inside the seam (past the jump zone), mirrored y
+    assert plat_a.cursor[0] == 1435
+    assert abs(plat_a.cursor[1] - 450) <= 1

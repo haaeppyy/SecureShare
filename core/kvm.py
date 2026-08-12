@@ -639,11 +639,34 @@ class KVMEngine:
                 ch.send_event(KIND_CONTROL_CANCEL, encode_handoff_message(rec["id"], "timeout"))
             except Exception:
                 pass
-        if rec["role"] == "controller":
-            self._blocked_edge[fp] = self._my_side_for(fp)
-            self._revert_control(ch, "handoff timeout")
-        else:
-            self._revert_remote(ch, "handoff timeout")
+        if ch is not None and not ch.closed:
+            if rec["role"] == "controller":
+                self._blocked_edge[fp] = self._my_side_for(fp)
+                self._revert_control(ch, "handoff timeout")
+            else:
+                self._revert_remote(ch, "handoff timeout")
+            return
+        # The channel is already gone: nothing can be notified, but the
+        # local control state must not linger. Otherwise the watchdog
+        # re-expires this same handoff every 200 ms and the state stays
+        # stuck in requesting/remote_preparing.
+        self._state.pop(fp, None)
+        self._handoffs.pop(fp, None)
+        self._blocked_edge.pop(fp, None)
+        self._last_sent_id.pop(fp, None)
+        if rec.get("role") == "controller" and rec.get("parked"):
+            self._restore_controller_cursor(fp, rec.get("fraction", 0.5))
+        try:
+            self._set_delegation_local()
+        except Exception:
+            pass
+        if self.platform is not None:
+            try:
+                self.platform.show_cursor()
+            except Exception:
+                pass
+        self._release_all_keys()
+        self.on_status("KVM handoff timed out - control returned to local")
 
     # -- platform callbacks (capture side) ------------------------------------
 
