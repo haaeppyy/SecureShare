@@ -174,6 +174,7 @@ class WindowsInputPlatform:
         if not _WIN_OK:
             raise WindowsPlatformError("pywin32 unavailable")
         self.engine = engine
+        engine._capture_origin = "win"
         self._stop.clear()
         self._hook_thread = threading.Thread(target=self._hook_main, name="kvm-hooks", daemon=True)
         self._hook_thread.start()
@@ -251,12 +252,8 @@ class WindowsInputPlatform:
             return _user32.CallNextHookEx(None, 0, wParam, info)
         if self._mode == "remote":
             # Physical input on the controlled computer intentionally ends
-            # sharing. SentInput events were returned above by their sentinel.
-            engine.on_status(
-                "KVM DEBUG: local input on Windows, mode=remote, sending revert",
-                level="error",
-            )
-            engine.on_remote_local_input()
+            # sharing. SendInput events were returned above by their sentinel.
+            engine.on_remote_local_input(origin="win-mouse")
             return 1
         try:
             if wParam == WM_MOUSEMOVE:
@@ -320,9 +317,19 @@ class WindowsInputPlatform:
 
     # -- delegation --------------------------------------------------------------
 
-    def set_delegation(self, state: str) -> None:
+    def set_delegation(self, state: str) -> bool:
         with self._lock:
             self._mode = state
+        return True
+
+    def diagnostics(self) -> dict:
+        with self._lock:
+            return {
+                "family": "win",
+                "mode": self._mode,
+                "hook_thread_alive": bool(self._hook_thread and self._hook_thread.is_alive()),
+                "ignore_warps": len(self._ignore_warps),
+            }
 
     # -- geometry -----------------------------------------------------------------
 

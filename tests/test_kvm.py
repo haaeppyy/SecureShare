@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import socket
+import struct
 import threading
 import time
 
@@ -24,6 +25,7 @@ from core.kvm_events import (
     KIND_CONTROL_BEGIN,
     KIND_CONTROL_REQUEST,
     KIND_KEY_DOWN,
+    KIND_MOUSE_MOVE_REL,
     encode_control_request,
     encode_key,
 )
@@ -46,9 +48,13 @@ class FakePlatform:
         self.cursor_hidden = False
         self.injected = []
         self.permissions_ok = True
+        self.delegation_fails = False
+        self.delegation_calls = []
+        self.restarts = 0
 
     def start(self, engine):
         self.engine = engine
+        self.restarts += 1
 
     def stop(self):
         pass
@@ -72,7 +78,11 @@ class FakePlatform:
         self.cursor_hidden = False
 
     def set_delegation(self, state):
+        self.delegation_calls.append(state)
+        if self.delegation_fails:
+            return False
         self.delegation = state
+        return True
 
     def inject_move_rel(self, dx, dy):
         self.injected.append(("rel", dx, dy))
@@ -796,6 +806,366 @@ def test_run_loop_survives_handler_exception(tmp_path, monkeypatch):
     assert not thread.is_alive()
     assert fp not in engine._channels
     assert fp not in engine._state
+
+
+# -- F1-F8: KVM hardening fixes ---------------------------------------------------
+
+def test_f1_send_failure_tears_down_session(tmp_path):
+    """A dead socket must not be swallowed: the session is torn down and
+    the per-peer state cannot stay frozen at remote."""
+    fp = "dead-peer"
+    engine, channel, toasts = make_stuck_engine(tmp_path, fp, consent=True)
+    engine.platform = FakePlatform("DeadScreen")
+    engine._state[fp] = "remote"
+    engine._handoffs[fp] = {
+        "id": 7,
+        "role": "target",
+        "stage": "active",
+        "deadline": None,
+        "entry": (48, 540),
+        "mask": 0,
+        "fraction": None,
+        "parked": False,
+    }
+    engine._channels[fp] = channel
+
+    engine.on_remote_local_input(origin="test")
+
+    ok = wait_for(lambda: channel.closed, timeout=5)
+    assert ok, "send failure must close the channel"
+    ok = wait_for(lambda: fp not in engine._state, timeout=5)
+    assert ok, "send failure must clear the frozen engine state"
+    assert any("send failed" in m for m, _ in toasts)
+    assert engine.diagnostics()["send_failures"] >= 1
+
+
+def test_f2_delegation_failure_surfaces_and_restarts_capture(tmp_path):
+    """A failed re-association is the stuck-cursor symptom: it must be
+    visible (error toast) and trigger a capture restart, not a swallow."""
+    fp = "sticky-peer"
+    store = TrustStore(str(tmp_path), keyring_enabled=False)
+    store.peers[fp] = {"name": "StickyBox", "kvm_allowed": True}
+    toasts = []
+    platform = FakePlatform("StickyScreen")
+    engine = KVMEngine(
+        store,
+        discovery=None,
+        platform=platform,
+        on_status=lambda m, level="info": toasts.append((m, level)),
+    )
+    channel = KvmChannel(
+        DummyConn(), fp, "StickyBox", os.urandom(32), os.urandom(8), os.urandom(8), engine, "target"
+    )
+    engine._state[fp] = "remote"
+    engine._handoffs[fp] = {
+        "id": 1,
+        "role": "target",
+        "stage": "active",
+        "deadline": None,
+        "entry": (48, 540),
+        "mask": 0,
+        "fraction": None,
+        "parked": False,
+    }
+    platform.delegation_fails = True
+    platform.restarts = 0
+
+    engine._revert_remote(channel, "test")
+
+    assert any("failed to restore local input" in m for m, _ in toasts)
+    assert platform.restarts == 1, "capture must be restarted after repeated failures"
+    assert engine._state.get(fp) == "local"
+
+
+def test_f3_waiting_active_label_and_transition_log(node_pair_ctx):
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    # During the handshake the state is "controlling" but input is not yet
+    # suppressed; the UI must render that intermediate stage distinctly.
+    rec = pair.a.kvm._handoffs[fp_b]
+    rec["stage"] = "waiting_active"
+    assert pair.a.kvm.control_label(fp_b) == "waiting_active"
+    assert pair.a.kvm.control_label(pair.a.store.fingerprint()) == "local"
+    assert len(pair.a.kvm.recent_transitions()) >= 3
+    assert any(stage == "waiting_active" for _, _, _s, stage, _h in pair.a.kvm.recent_transitions())
+
+
+def test_f4_concurrent_callback_and_reader_traffic(node_pair_ctx):
+    """F4: the state machine must survive interleaved platform callbacks
+    and channel events without losing the handoff."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+
+    def traffic(plat):
+        for i in range(200):
+            plat.move(3, 0)
+            plat.click(0, True)
+            plat.click(0, False)
+            plat.scroll(120)
+            hid = mac_vk_to_hid(0x00)
+            plat.press(hid)
+            plat.release(hid)
+            time.sleep(0.001)
+
+    threads = [threading.Thread(target=traffic, args=(p,), daemon=True) for p in (plat_a, plat_b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert pair.a.kvm.control_state(fp_b) == "local"
+    assert pair.b.kvm.control_state(pair.a.store.fingerprint()) == "local"
+
+
+def test_f5_local_input_revert_reports_origin(node_pair_ctx):
+    """F5: reverts must say which local input path triggered them, so a
+    stuck "input on the target" episode is diagnosable."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    take_control(pair, plat_a, plat_b)
+    toasts = []
+    pair.b.kvm.on_status = lambda m, level="info": toasts.append((m, level))
+    pair.b.kvm._capture_origin = "mac"
+    plat_b.move(10, 0)
+    ok = wait_for(lambda: any("mac-pointer" in m for m, _ in toasts))
+    assert ok, f"pointer origin missing from toasts: {toasts}"
+    assert pair.b.kvm.control_state(pair.a.store.fingerprint()) == "local"
+    ok = wait_for(lambda: pair.a.kvm.control_state(pair.b.store.fingerprint()) == "local", timeout=5)
+    assert ok, f"A never reverted; got {pair.a.kvm.control_state(pair.b.store.fingerprint())}"
+
+    plat_a.cursor = (700, 450)
+    take_control(pair, plat_a, plat_b)
+    pair.b.kvm._capture_origin = "win"
+    plat_b.press(mac_vk_to_hid(0x00))
+    ok = wait_for(lambda: any("win-key" in m for m, _ in toasts))
+    assert ok, f"key origin missing from toasts: {toasts}"
+
+
+def test_f7_keyboard_stall_escalation_and_recovery(tmp_path):
+    """F7: a stalled keyboard stream (mouse alive, keys dead) escalates
+    from tap restart to a latched mouse-only notice, then recovers."""
+    fp = "stall-peer"
+    store = TrustStore(str(tmp_path), keyring_enabled=False)
+    store.peers[fp] = {"name": "StallBox", "kvm_allowed": True}
+    toasts = []
+
+    class StallingPlatform(FakePlatform):
+        def __init__(self):
+            super().__init__("StallScreen")
+            self.health = "stalled"
+            self.stall_notices = 0
+
+        def keyboard_health(self):
+            return self.health
+
+        def note_keyboard_stall(self):
+            self.stall_notices += 1
+
+    platform = StallingPlatform()
+    engine = KVMEngine(
+        store,
+        discovery=None,
+        platform=platform,
+        on_status=lambda m, level="info": toasts.append((m, level)),
+    )
+    engine._state[fp] = "remote"
+
+    engine._poll_keyboard_health()
+    assert platform.stall_notices == 1
+    assert engine._keyboard_stall_stage == 1
+
+    engine._poll_keyboard_health()
+    assert engine._keyboard_stall_stage == 2
+    assert any("Secure Input" in m for m, _ in toasts)
+
+    platform.health = "ok"
+    engine._poll_keyboard_health()
+    assert engine._keyboard_stall_stage == 0
+    assert any("recovered" in m for m, _ in toasts)
+
+    engine._state[fp] = "local"
+    platform.health = "stalled"
+    engine._poll_keyboard_health()
+    assert engine._keyboard_stall_stage == 0, "no session: must not diagnose a stall"
+
+
+def test_f8_rel_coalescing_and_control_priority(tmp_path):
+    """F8: relative moves coalesce into single frames behind control
+    events, which jump the queue and are never delayed by a mouse burst."""
+    fp = "flow-peer"
+    engine, channel, toasts = make_stuck_engine(tmp_path, fp, consent=True)
+    engine.platform = FakePlatform("FlowScreen")
+    conn = LiveDummyConn()
+    channel.conn = conn
+    engine._channels[fp] = channel
+
+    channel.send_event(KIND_MOUSE_MOVE_REL, struct.pack(">hh", 3, 4))
+    channel.send_event(KIND_MOUSE_MOVE_REL, struct.pack(">hh", 5, 6))
+    channel.send_event(KIND_MOUSE_MOVE_REL, struct.pack(">hh", -2, 8))
+    channel.send_event(KIND_KEY_DOWN, encode_key(0x04))
+
+    ok = wait_for(lambda: len(conn.sent) >= 2, timeout=5)
+    assert ok, f"expected coalesced+control frames, got {len(conn.sent)}"
+
+    frames = []
+    for raw in conn.sent:
+        (size,) = struct.unpack(">I", raw[:4])
+        frames.append(crypto.decrypt_with_nonce(channel.key, crypto.chunk_nonce(channel.nonce8_out, len(frames)), raw[4 : 4 + size]))
+
+    kinds = [f[0] for f in frames]
+    assert kinds[0] == KIND_KEY_DOWN, f"control frame must go first: {kinds}"
+    assert kinds[1] == KIND_MOUSE_MOVE_REL, f"moves must coalesce after: {kinds}"
+    assert len(frames) == 2, f"3 rel moves must collapse into 1 frame: {frames}"
+    dx, dy = struct.unpack(">hh", frames[1][1:])
+    assert (dx, dy) == (6, 18), f"coalesced deltas wrong: {(dx, dy)}"
+
+
+def test_p1_deadlock_send_failure_teardown_releases_channel_lock(tmp_path):
+    """P1a: engine_remove must never run while the channel lock is held
+    (the engine lock is taken inside on_channel_closed, inverting the
+    callback order engine-lock -> send_event -> channel-lock)."""
+    fp = "deadlock-peer"
+    engine, channel, toasts = make_stuck_engine(tmp_path, fp, consent=True)
+    engine._state[fp] = "remote"
+    engine._handoffs[fp] = {
+        "id": 9,
+        "role": "target",
+        "stage": "active",
+        "deadline": None,
+        "entry": (48, 540),
+        "mask": 0,
+        "fraction": None,
+        "parked": False,
+    }
+    engine._channels[fp] = channel
+
+    lock_held_at_remove = []
+    original = channel.engine_remove
+
+    def guarded():
+        lock_held_at_remove.append(channel._lock.locked())
+        original()
+
+    channel.engine_remove = guarded
+    channel.send_event(KIND_KEY_DOWN, encode_key(0x04))
+
+    ok = wait_for(lambda: lock_held_at_remove, timeout=5)
+    assert ok, "engine_remove was never reached"
+    assert lock_held_at_remove == [False], "engine_remove ran under the channel lock"
+    ok = wait_for(lambda: fp not in engine._state, timeout=5)
+    assert ok, "teardown must clear the frozen engine state"
+
+
+def test_p1_deadlock_send_failure_completes_under_held_engine_lock(tmp_path):
+    """P1a: the send-failure teardown must complete even while a platform
+    callback holds the engine lock (the inversion scenario)."""
+    fp = "invert-peer"
+    engine, channel, toasts = make_stuck_engine(tmp_path, fp, consent=True)
+    engine._state[fp] = "remote"
+    engine._handoffs[fp] = {
+        "id": 10,
+        "role": "target",
+        "stage": "active",
+        "deadline": None,
+        "entry": (48, 540),
+        "mask": 0,
+        "fraction": None,
+        "parked": False,
+    }
+    engine._channels[fp] = channel
+
+    with engine._lock:  # simulate on_local_key holding the engine lock
+        channel.send_event(KIND_KEY_DOWN, encode_key(0x04))
+        time.sleep(0.2)
+    ok = wait_for(lambda: fp not in engine._state, timeout=5)
+    assert ok, "teardown must not deadlock against a held engine lock"
+    assert channel.closed
+
+
+def test_p1_overflow_split_keeps_writer_alive(tmp_path):
+    """P1b: a coalesced delta beyond ±32767 must be split into wire-format
+    chunks, not raise in the writer thread and strand the session."""
+    fp = "overflow-peer"
+    engine, channel, toasts = make_stuck_engine(tmp_path, fp, consent=True)
+    conn = LiveDummyConn()
+    channel.conn = conn
+    channel._dataq.append(("rel", 200000, -100000))
+    with channel._sendcv:
+        channel._sendcv.notify_all()
+
+    total_dx = 200000
+    total_dy = -100000
+    chunks = max((total_dx + 32766) // 32767, (-total_dy + 32766) // 32767)
+    ok = wait_for(lambda: len(conn.sent) >= chunks, timeout=5)
+    assert ok, f"expected {chunks} split frames, got {len(conn.sent)}"
+
+    frames = []
+    for raw in conn.sent:
+        (size,) = struct.unpack(">I", raw[:4])
+        frames.append(crypto.decrypt_with_nonce(channel.key, crypto.chunk_nonce(channel.nonce8_out, len(frames)), raw[4 : 4 + size]))
+
+    dx = dy = 0
+    for f in frames:
+        assert f[0] == KIND_MOUSE_MOVE_REL
+        cdx, cdy = struct.unpack(">hh", f[1:])
+        assert -32767 <= cdx <= 32767 and -32767 <= cdy <= 32767, (cdx, cdy)
+        dx += cdx
+        dy += cdy
+    assert (dx, dy) == (total_dx, total_dy), f"split must preserve motion: {(dx, dy)}"
+    assert not channel.closed, "the writer must survive a large delta"
+
+
+def test_p1_no_keys_grace_and_single_tap_restart(tmp_path):
+    """F7: 'no keys ever during the session' is ambiguous; it must wait
+    out the grace period, restart the tap once, and never latch."""
+    from core.kvm import KEYBOARD_NO_KEY_GRACE
+
+    fp = "nokeys-peer"
+    store = TrustStore(str(tmp_path), keyring_enabled=False)
+    store.peers[fp] = {"name": "NoKeysBox", "kvm_allowed": True}
+    toasts = []
+
+    class NoKeysPlatform(FakePlatform):
+        def __init__(self):
+            super().__init__("NoKeysScreen")
+            self.health = "no_keys"
+            self.stall_notices = 0
+
+        def keyboard_health(self):
+            return self.health
+
+        def note_keyboard_stall(self):
+            self.stall_notices += 1
+
+    platform = NoKeysPlatform()
+    engine = KVMEngine(
+        store,
+        discovery=None,
+        platform=platform,
+        on_status=lambda m, level="info": toasts.append((m, level)),
+    )
+    engine._state[fp] = "remote"
+    engine._active_since = time.monotonic()
+    engine._poll_keyboard_health()
+    assert engine._keyboard_stall_stage == 0, "young session must be exempt"
+    assert platform.stall_notices == 0
+
+    engine._active_since = time.monotonic() - KEYBOARD_NO_KEY_GRACE - 1.0
+    engine._poll_keyboard_health()
+    assert engine._keyboard_stall_stage == 1
+    assert platform.stall_notices == 1
+    assert any("no keyboard input" in m for m, _ in toasts)
+
+    engine._poll_keyboard_health()
+    assert engine._keyboard_stall_stage == 1, "must never latch mouse-only on no_keys"
+    assert platform.stall_notices == 1, "tap restart must happen exactly once"
+    assert not any("Secure Input" in m for m, _ in toasts)
+
+    platform.health = "ok"
+    engine._poll_keyboard_health()
+    assert engine._keyboard_stall_stage == 0, "keys arriving must reset the stage"
 
 
 pytestmark = pytest.mark.socket

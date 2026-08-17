@@ -990,7 +990,7 @@ class TrayApp:
         """Per-peer KVM state. Link and control are separate on purpose."""
         try:
             link = self.node.kvm.link_status(fp)
-            control = self.node.kvm.control_state(fp)
+            control = self.node.kvm.control_label(fp)
         except Exception:
             link = "offline"
             control = "local"
@@ -998,6 +998,8 @@ class TrayApp:
             return "off"
         if control == "controlling":
             return "controlling"
+        if control == "waiting_active":
+            return "waiting for peer"
         if control == "remote":
             return "controlled by peer"
         if control in ("requesting", "remote_preparing", "reverting"):

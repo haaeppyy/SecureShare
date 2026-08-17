@@ -1,5 +1,7 @@
 """macOS input-platform behavior that is safe to test without real input."""
 
+import time
+
 import pytest
 
 from core import kvm_platform_mac as mac
@@ -68,6 +70,138 @@ def test_remote_delegation_disassociates_the_physical_pointing_device(monkeypatc
 
     assert quartz.associations == [False, True]
     assert quartz.show_calls == 1
+
+
+class _QuartzForDelegationFailure:
+    def __init__(self):
+        self.associations = []
+        self.show_calls = 0
+        self.fail = False
+
+    def CGAssociateMouseAndMouseCursorPosition(self, associated):
+        if self.fail:
+            raise OSError("association refused")
+        self.associations.append(associated)
+
+    def CGMainDisplayID(self):
+        return 1
+
+    def CGDisplayShowCursor(self, display_id):
+        self.show_calls += 1
+
+
+def test_f2_delegation_failure_returns_false_and_keeps_old_mode(monkeypatch):
+    """A failed CGAssociate... call must surface as False and must NOT
+    flip _mode: the platform is still coupled, so claiming otherwise is
+    the stuck-cursor lie."""
+    quartz = _QuartzForDelegationFailure()
+    monkeypatch.setattr(mac, "Quartz", quartz)
+    monkeypatch.setattr(mac, "_QUARTZ_OK", True)
+    platform = mac.MacInputPlatform()
+    assert platform.set_delegation("remote") is True
+    assert platform._mode == "remote"
+
+    quartz.fail = True
+    assert platform.set_delegation("local") is False
+    assert platform._mode == "remote", "mode must roll back on failure"
+
+
+def test_f6_diagnostics_reports_counters_and_first_exception(monkeypatch):
+    quartz = _QuartzForMove()
+    monkeypatch.setattr(mac, "Quartz", quartz)
+    monkeypatch.setattr(mac, "_QUARTZ_OK", True)
+    platform = mac.MacInputPlatform()
+
+    platform._bump("exceptions")
+    platform._bump("tap_keys")
+    platform._bump("tap_disables")
+    platform._note_exception(RuntimeError("boom"))
+
+    diag = platform.diagnostics()
+    assert diag["exceptions"] == 2
+    assert diag["tap_keys"] == 1
+    assert diag["tap_disables"] == 1
+    assert "boom" in diag["first_exception"]
+    assert diag["family"] == "mac"
+
+
+def test_f7_keyboard_health_states(monkeypatch):
+    monkeypatch.setattr(mac, "_QUARTZ_OK", True)
+    platform = mac.MacInputPlatform()
+
+    assert platform.keyboard_health() == "idle"
+
+    platform._last_any = time.monotonic()
+    platform._last_key = time.monotonic()
+    assert platform.keyboard_health() == "ok"
+
+    # Mouse events still flowing, keys silent for > 2s: the Secure Input
+    # signature. (Deliberately no kCGEvent constants here: the platform
+    # records these timestamps in _handle_tap.)
+    platform._last_any = time.monotonic()
+    platform._last_key = time.monotonic() - 3.0
+    assert platform.keyboard_health() == "stalled"
+
+    # Mouse alive but zero key events ever: the ambiguous signature.
+    platform._last_any = time.monotonic()
+    platform._last_key = 0.0
+    assert platform.keyboard_health() == "no_keys"
+
+    # Nothing at all for > 5s is a quiet machine, not a stall.
+    platform._last_any = time.monotonic() - 10.0
+    platform._last_key = 0.0
+    assert platform.keyboard_health() == "idle"
+
+
+class _QuartzNoKeyRepeat:
+    """Mirrors real pyobjc: kCGKeyboardEventKeyRepeat does NOT exist
+    (the genuine constant is kCGKeyboardEventAutorepeat). Accessing the
+    missing attribute must raise AttributeError, exactly like a module."""
+
+    kCGEventKeyDown = 10
+    kCGEventKeyUp = 11
+    kCGEventSourceUserData = 42
+    kCGEventSourceUnixProcessID = 43
+    kCGKeyboardEventAutorepeat = 8
+    kCGKeyboardEventKeycode = 9
+
+    def CGEventGetIntegerValueField(self, event, field):
+        return event.get(field, 0)
+
+
+def test_key_forwarding_survives_pyobjc_without_keyrepeat_attr(monkeypatch):
+    """The live-Mac spike found every key event raising AttributeError on
+    kCGKeyboardEventKeyRepeat: the forward path must use
+    kCGKeyboardEventAutorepeat and reach on_local_key, with the F6
+    counters reflecting the mapping instead of an exception."""
+    quartz = _QuartzNoKeyRepeat()
+    monkeypatch.setattr(mac, "Quartz", quartz)
+    monkeypatch.setattr(mac, "_QUARTZ_OK", True)
+    platform = mac.MacInputPlatform()
+    seen = []
+
+    class Engine:
+        def on_local_key(self, hid, down):
+            seen.append((hid, down))
+
+    platform.engine = Engine()
+    event = {
+        quartz.kCGEventSourceUserData: 0,
+        quartz.kCGEventSourceUnixProcessID: 0,
+        quartz.kCGKeyboardEventAutorepeat: 0,
+        quartz.kCGKeyboardEventKeycode: 0x00,  # 'a'
+    }
+    platform._forward(event, quartz.kCGEventKeyDown)
+    platform._forward(event, quartz.kCGEventKeyUp)
+    assert seen == [(0x04, True), (0x04, False)], seen
+
+    event[quartz.kCGKeyboardEventAutorepeat] = 1
+    platform._forward(event, quartz.kCGEventKeyDown)
+    assert seen == [(0x04, True), (0x04, False)], "autorepeat must be filtered"
+
+    assert platform._stats["tap_keys"] == 3
+    assert platform._stats["hid_mapped"] == 2
+    assert platform._stats["exceptions"] == 0, "no key may raise an exception"
 
 
 pytestmark = pytest.mark.unit
