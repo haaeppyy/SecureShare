@@ -22,6 +22,7 @@ Requires Accessibility permission for both the event tap and CGEventPost
 (CGPreflightListenEventAccess / CGPreflightPostEventAccess).
 """
 
+import collections
 import os
 import threading
 import time
@@ -87,8 +88,17 @@ class MacInputPlatform:
             "exceptions": 0,
             "tap_disables": 0,
             "tap_restarts": 0,
+            "assoc_false": 0,
+            "assoc_true": 0,
+            "assoc_errors": 0,
         }
         self._first_exception = None
+        # F6: every CGAssociateMouseAndMouseCursorPosition attempt, whether
+        # it raised, and the state that requested it.  Quartz has no useful
+        # success return, so "ok" only means "did not raise"; the spike
+        # (--controller) verifies the runtime effect on a real Mac.
+        self._assoc_seq = 0
+        self._assoc_calls: collections.deque = collections.deque(maxlen=32)
         # F7 keyboard health: last event / last key seen at the tap.
         self._last_any = 0.0
         self._last_key = 0.0
@@ -103,6 +113,7 @@ class MacInputPlatform:
                 "family": "mac",
                 "mode": self._mode,
                 **dict(self._stats),
+                "assoc_calls": list(self._assoc_calls),
                 "first_exception": self._first_exception,
                 "last_key_age": time.monotonic() - self._last_key if self._last_key else None,
                 "last_any_age": time.monotonic() - self._last_any if self._last_any else None,
@@ -126,10 +137,7 @@ class MacInputPlatform:
         # Never leave the user's pointing device decoupled if sharing stops
         # while this Mac is being controlled remotely.
         if _QUARTZ_OK:
-            try:
-                Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-            except Exception:
-                pass
+            self._record_assoc(True, "stop")
         self._stop.set()
         with self._lock:
             rl = self._tap_runloop
@@ -406,6 +414,34 @@ class MacInputPlatform:
 
     # -- delegation ------------------------------------------------------------
 
+    def _record_assoc(self, associate: bool, state: str) -> bool:
+        """Call CGAssociateMouseAndMouseCursorPosition and record the outcome.
+
+        Quartz returns no useful value, so success is only "did not raise".
+        Every attempt is timestamped with a monotonic sequence number and the
+        requesting state for the F6 diagnostics / handoff audit.
+        """
+        try:
+            _q().CGAssociateMouseAndMouseCursorPosition(associate)
+            ok = True
+        except Exception:
+            ok = False
+        self._assoc_seq += 1
+        rec = {
+            "t": time.monotonic(),
+            "seq": self._assoc_seq,
+            "associate": bool(associate),
+            "state": state,
+            "ok": ok,
+        }
+        with self._lock:
+            self._assoc_calls.append(rec)
+        if ok:
+            self._bump("assoc_true" if associate else "assoc_false")
+        else:
+            self._bump("assoc_errors")
+        return ok
+
     def set_delegation(self, state: str) -> bool:
         """Apply the delegation, returning success.
 
@@ -413,7 +449,6 @@ class MacInputPlatform:
         CGAssociate... call must never leave the platform believing it is
         decoupled when it is not (F2) - that is the stuck-cursor symptom.
         """
-        q = _q()
         if state in ("remote", "controlling"):
             # Decouples hardware mouse deltas from the on-screen cursor.
             # Needed in both directions: "remote" so injected absolute moves
@@ -422,17 +457,13 @@ class MacInputPlatform:
             # swallowing the CGEvent in the tap callback only stops apps
             # from seeing it, it does not stop WindowServer from moving the
             # cursor sprite off raw HID deltas.
-            try:
-                q.CGAssociateMouseAndMouseCursorPosition(False)
-            except Exception:
+            if not self._record_assoc(False, state):
                 return False
             with self._lock:
                 self._mode = state
             return True
         if state == "local":
-            try:
-                q.CGAssociateMouseAndMouseCursorPosition(True)
-            except Exception:
+            if not self._record_assoc(True, state):
                 return False
             with self._lock:
                 self._mode = state
@@ -649,6 +680,10 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--spike", action="store_true")
+    parser.add_argument("--controller", action="store_true",
+                        help="simulate controller mode: park the cursor, call "
+                             "CGAssociate(False), print per-second diagnostics "
+                             "while you physically move the mouse")
     parser.add_argument("--seconds", type=int, default=6)
     args = parser.parse_args()
 
@@ -675,6 +710,9 @@ def main():
     print(f"listen permission: {platform.permission_ok()}", flush=True)
     layout = platform.screen_layout()
     print(f"layout: {layout.to_monitors()}", flush=True)
+    if args.controller:
+        _controller_spike(args)
+        return
     platform.start(_Engine())
 
     def print_diag():
@@ -722,6 +760,83 @@ def main():
     time.sleep(args.seconds)
     platform.stop()
     print("spike done", flush=True)
+
+
+def _controller_spike(args) -> None:
+    """Manual diagnostic for the "Mac controller cursor moves while
+    controlling Windows" symptom:
+
+        python -m core.kvm_platform_mac --controller 10
+
+    Parks the cursor at the screen center, applies the "controlling"
+    delegation (CGAssociateMouseAndMouseCursorPosition(False)) and prints
+    per-second state while the operator physically moves the mouse.
+
+    Expected on a healthy Mac: the cursor stays parked (physical movement
+    is swallowed at the tap and only forwarded as rel deltas), mode stays
+    "controlling", assoc_false == 1 and assoc_true == 0 until the exit
+    restore.  Any re-association during the run shows up in assoc_calls.
+
+    The diagnostics only prove Quartz did not raise; a cursor that still
+    moves despite a clean record points at macOS/device/external software
+    rather than this code path.
+    """
+    class _Engine:
+        def on_status(self, msg):
+            print(f"[status] {msg}", flush=True)
+
+        def on_local_mouse(self, dx, dy, x, y):
+            print(f"  mouse rel=({dx},{dy}) abs=({x},{y})", flush=True)
+
+        def on_local_button(self, button, down):
+            pass
+
+        def on_local_wheel(self, dy, dx):
+            pass
+
+        def on_local_key(self, hid, down):
+            pass
+
+        def on_remote_edge(self, side, x, y):
+            pass
+
+    platform = MacInputPlatform()
+    layout = platform.screen_layout()
+    cx, cy = layout.left() + layout.width() // 2, layout.top() + layout.height() // 2
+    print(f"controller spike: park at ({cx},{cy}), delegation -> controlling", flush=True)
+    platform.start(_Engine())
+    platform.warp_cursor(cx, cy)
+    platform.hide_cursor()
+    ok = platform.set_delegation("controlling")
+    print(f"set_delegation('controlling') -> {ok}", flush=True)
+
+    prev = None
+    start = time.monotonic()
+    while time.monotonic() - start < args.seconds:
+        time.sleep(1.0)
+        try:
+            d = platform.diagnostics()
+        except Exception:
+            continue
+        pos = platform.cursor_position()
+        keys = ("assoc_false", "assoc_true", "assoc_errors", "tap_keys")
+        line = f"[diag] mode={d['mode']} cursor={pos} " + " ".join(f"{k}={d.get(k, 0)}" for k in keys)
+        if prev is not None and d.get("assoc_calls"):
+            new_calls = [c for c in d["assoc_calls"] if c["seq"] > prev.get("seq", 0)]
+            if new_calls:
+                line += f" NEW_ASSOC={new_calls}"
+        print(line, flush=True)
+        prev = {**d, "seq": d["assoc_calls"][-1]["seq"] if d["assoc_calls"] else 0}
+
+    print("restoring local delegation...", flush=True)
+    platform.set_delegation("local")
+    platform.show_cursor()
+    platform.stop()
+    d = platform.diagnostics()
+    print(f"final: mode={d['mode']} assoc_false={d['assoc_false']} "
+          f"assoc_true={d['assoc_true']} assoc_errors={d['assoc_errors']} "
+          f"calls={d['assoc_calls']}", flush=True)
+    print("controller spike done", flush=True)
 
 
 if __name__ == "__main__":

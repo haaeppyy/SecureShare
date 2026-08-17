@@ -140,6 +140,43 @@ Privacy & Security → Accessibility); the app toasts when it is missing.
       → both sides show a layout-mismatch toast and takeover is refused
       until fixed
 
+## 9b. KVM handoff diagnostics — macOS controller cursor
+
+Problem A: while a Mac controls Windows the Mac cursor must stay parked at
+the seam center; physical Mac movement is swallowed and forwarded only. The
+engine now records every `CGAssociateMouseAndMouseCursorPosition` attempt
+(`assoc_false/assoc_true/assoc_errors/assoc_calls` in the platform
+diagnostics), plus edge latches (`blocked_edges`) and transition reasons.
+
+- [ ] Isolated platform check: `python -m core.kvm_platform_mac --controller 10`
+      on the Mac. Move the physical mouse during the 10 s run.
+      Expected: `mode=controlling`, `cursor=(center)` stays parked while the
+      `mouse rel=(dx,dy)` lines keep printing (forwarded, not applied);
+      `assoc_false=1`, `assoc_true=0`, no `NEW_ASSOC` lines while running;
+      final line shows `assoc_true=1` after the restore. A cursor that moves
+      despite `assoc_false=1` and a clean record points at macOS/device/
+      external software, not this code path.
+- [ ] Full-flow check in the real app (Mac controls Windows):
+      - A controls B; while controlling, move the Mac mouse for ~10 s.
+      - A's cursor must remain parked (hidden at the seam center) and
+        Windows' cursor must follow the movements.
+      - Read the F6 diagnostics (engine state, `platform.mode`,
+        `assoc_false/assoc_true`, `blocked_edges`, recent transitions).
+      - Expected: engine `state=controlling`, `platform.mode=controlling`,
+        `assoc_false == 1`, `assoc_true == 0` while active, and no
+        `set_delegation("local")`/True association until revert.
+- [ ] Handback latch (Problem B): with A controlling B, wiggle B's physical
+      mouse → both devices become local; A's menu shows "local" and A does
+      NOT immediately re-take B even though A's cursor sits near the seam;
+      A must move clearly away from the edge and back to take control again.
+      Check `blocked_edges` shows A's side latched right after the revert
+      and empty after A's cursor left the latch zone.
+- [ ] B then moves its own mouse to its edge and controls A (the
+      former-controller latch must not block the new direction).
+- [ ] Regression: escape chord (Ctrl+Option+Space), channel loss mid-
+      takeover, and repeated deliberate edge handoffs all still behave as
+      in section 9.
+
 ## 10. Keyboard & mouse sharing (KVM) — Windows
 
 The Windows platform (`kvm_platform_win.py`, scan-code injection,

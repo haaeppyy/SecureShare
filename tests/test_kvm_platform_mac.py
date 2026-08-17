@@ -33,8 +33,11 @@ class _QuartzForDelegation:
     def __init__(self):
         self.associations = []
         self.show_calls = 0
+        self.fail = False
 
     def CGAssociateMouseAndMouseCursorPosition(self, associated):
+        if self.fail:
+            raise OSError("association refused")
         self.associations.append(associated)
 
     def CGMainDisplayID(self):
@@ -70,6 +73,66 @@ def test_remote_delegation_disassociates_the_physical_pointing_device(monkeypatc
 
     assert quartz.associations == [False, True]
     assert quartz.show_calls == 1
+
+
+def test_controlling_delegation_records_association_diagnostics(monkeypatch):
+    """Problem A diagnostics: every CGAssociate... attempt is timestamped
+    with the requested state and whether Quartz raised.  Controlling must
+    issue exactly one False association and no True until local/stop."""
+    quartz = _QuartzForDelegation()
+    monkeypatch.setattr(mac, "Quartz", quartz)
+    monkeypatch.setattr(mac, "_QUARTZ_OK", True)
+    platform = mac.MacInputPlatform()
+
+    assert platform.set_delegation("controlling") is True
+    diag = platform.diagnostics()
+    assert diag["mode"] == "controlling"
+    assert diag["assoc_false"] == 1
+    assert diag["assoc_true"] == 0
+    assert diag["assoc_errors"] == 0
+    calls = diag["assoc_calls"]
+    assert len(calls) == 1
+    rec = calls[0]
+    assert rec["associate"] is False
+    assert rec["state"] == "controlling"
+    assert rec["ok"] is True
+    assert rec["seq"] == 1
+
+    # Idempotent re-apply while still controlling: still one False, no True.
+    assert platform.set_delegation("controlling") is True
+    diag = platform.diagnostics()
+    assert diag["assoc_false"] == 2 and diag["assoc_true"] == 0
+    assert all(c["associate"] is False for c in diag["assoc_calls"])
+
+    # Local restore: exactly one True, the previous False call kept.
+    assert platform.set_delegation("local") is True
+    diag = platform.diagnostics()
+    assert diag["assoc_false"] == 2 and diag["assoc_true"] == 1
+    assert diag["assoc_calls"][-1]["associate"] is True
+    assert diag["assoc_calls"][-1]["state"] == "local"
+
+    # stop() re-associates and records it under the "stop" state.
+    platform.stop()
+    diag = platform.diagnostics()
+    assert diag["assoc_true"] == 2
+    assert diag["assoc_calls"][-1]["state"] == "stop"
+
+
+def test_failed_association_recorded_without_flipping_mode(monkeypatch):
+    """A raised CGAssociate... call is recorded as ok=False, bumps
+    assoc_errors, and must NOT flip _mode (the stuck-cursor lie)."""
+    quartz = _QuartzForDelegation()
+    monkeypatch.setattr(mac, "Quartz", quartz)
+    monkeypatch.setattr(mac, "_QUARTZ_OK", True)
+    platform = mac.MacInputPlatform()
+
+    quartz.fail = True
+    assert platform.set_delegation("controlling") is False
+    assert platform._mode == "local"
+    diag = platform.diagnostics()
+    assert diag["assoc_errors"] == 1
+    assert diag["assoc_calls"][-1]["ok"] is False
+    assert diag["assoc_calls"][-1]["associate"] is False
 
 
 class _QuartzForDelegationFailure:

@@ -16,6 +16,12 @@ which is exact for the single-monitor case.
 
 SIDES = ("left", "right", "top", "bottom")
 JUMP_ZONE = 3  # px from an edge that counts as reaching for the neighbor
+# Wider zone used ONLY to decide when an edge latch (_blocked_edge) may
+# clear after a handoff returns control: the cursor is restored just
+# inside the seam (return_point), so a 3 px clear zone would drop the
+# latch on the first residual wiggle.  Must stay wider than the return
+# point inset (JUMP_ZONE + 1) and is never used for seam detection.
+LATCH_ZONE = 8
 # A handoff must begin visibly inside the receiving display.  Starting only
 # one jump-zone past the edge makes residual motion from the crossing clamp
 # the cursor back to that edge before the user can steer it.

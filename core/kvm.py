@@ -102,6 +102,8 @@ from .kvm_events import (
 )
 from .kvm_geometry import (
     GeometryError,
+    JUMP_ZONE,
+    LATCH_ZONE,
     ScreenLayout,
     entry_point,
     in_jump_zone,
@@ -567,9 +569,24 @@ class KVMEngine:
         with self._stats_lock:
             self._stats[name] = self._stats.get(name, 0) + amount
 
-    def _log_transition(self, fp: str, state: str, stage=None, hid=None) -> None:
+    def _log_transition(
+        self, fp: str, state: str, stage=None, hid=None, reason: str = None
+    ) -> None:
+        """Append (ts, fp, state, stage, hid, reason, blocked_edge_after).
+
+        ``blocked_edge_after`` is the per-peer edge latch at log time; it is
+        what tells a handback from an accidental immediate re-acquire apart.
+        """
         self._transition_log.append(
-            (time.monotonic(), fp, state, stage or "", hid or 0)
+            (
+                time.monotonic(),
+                fp,
+                state,
+                stage or "",
+                hid or 0,
+                reason or "",
+                self._blocked_edge.get(fp),
+            )
         )
 
     def recent_transitions(self) -> list:
@@ -596,6 +613,7 @@ class KVMEngine:
                 len(ch._ctrlq) + len(ch._dataq) for ch in self._channels.values()
             )
             out["state"] = dict(self._state)
+            out["blocked_edges"] = dict(self._blocked_edge)
             out["transitions"] = list(self._transition_log)
         if self.platform is not None:
             try:
@@ -1013,24 +1031,28 @@ class KVMEngine:
         if not self.enabled or self.platform is None:
             return
         with self._lock:
-            cursor_side = self._cursor_side(x, y)
-            # Clear edge blocks once the pointer leaves the blocked edge
-            # (and unblock the target's denial latch for retries).
+            handoff_side = self._cursor_side(x, y)
+            # Edge latches (a handback or refusal) clear only once the
+            # pointer has clearly left the edge: the wider LATCH_ZONE, not
+            # the 3 px handoff zone.  A revert restores the cursor just
+            # inside the seam, so an 8 px latch zone keeps the former
+            # controller from re-acquiring on residual motion.
+            latch_side = self._cursor_side(x, y, LATCH_ZONE)
             for fp in list(self._blocked_edge):
-                if cursor_side is None or cursor_side != self._blocked_edge[fp]:
+                if latch_side is None or latch_side != self._blocked_edge[fp]:
                     self._blocked_edge.pop(fp, None)
                     self._send_edge_left_cancel(fp)
             channel = self._active_channel()
             if channel is not None:
-                self._on_active_local_mouse(channel, dx, dy, x, y, cursor_side)
+                self._on_active_local_mouse(channel, dx, dy, x, y, handoff_side)
                 return
-            if cursor_side is None:
+            if handoff_side is None:
                 return
-            channel = self._channel_for(cursor_side)
+            channel = self._channel_for(handoff_side)
             if channel is None:
                 return
             fp = channel.peer_fp
-            if cursor_side != self._my_side_for(fp):
+            if handoff_side != self._my_side_for(fp):
                 return
             if fp in self._blocked_edge:
                 return
@@ -1039,8 +1061,8 @@ class KVMEngine:
             peer_layout = self._peer_layouts.get(fp)
             if peer_layout is None:
                 return
-            fraction = seam_fraction(self._my_layout(), cursor_side, x, y)
-            tx, ty = entry_point(peer_layout, cursor_side, fraction)
+            fraction = seam_fraction(self._my_layout(), handoff_side, x, y)
+            tx, ty = entry_point(peer_layout, handoff_side, fraction)
             self._request_control(channel, tx, ty, fraction)
 
     def _on_active_local_mouse(self, channel, dx: int, dy: int, x: int, y: int, cursor_side) -> None:
@@ -1220,6 +1242,10 @@ class KVMEngine:
                 if state in (STATE_REMOTE, STATE_REMOTE_PREPARING):
                     self._revert_remote(channel, "escape chord", origin="escape")
                 else:
+                    # Same protection as a peer-driven revert: the cursor is
+                    # restored just inside the seam, so latch the edge until
+                    # the pointer clearly leaves it.
+                    self._blocked_edge[fp] = self._my_side_for(fp)
                     self._revert_control(channel, "escape chord", origin="escape")
 
     def on_display_change(self) -> None:
@@ -1492,6 +1518,12 @@ class KVMEngine:
         if state in (STATE_REMOTE, STATE_REMOTE_PREPARING):
             self._revert_remote(channel, f"{reason}")
         else:
+            # A target-driven revert restores our cursor just inside the
+            # seam; latch that edge so residual motion cannot immediately
+            # re-acquire control.  The latch clears once the pointer leaves
+            # the LATCH_ZONE (on_local_mouse).
+            if rec["role"] == "controller" and state in (STATE_CONTROLLING, STATE_REQUESTING):
+                self._blocked_edge[fp] = self._my_side_for(fp)
             self._revert_control(channel, f"{reason}")
 
     # -- platform failure -> safe revert ---------------------------------------
@@ -1521,9 +1553,11 @@ class KVMEngine:
         rec = self._handoffs.get(fp)
         parked = bool(rec and rec.get("parked"))
         fraction = rec.get("fraction", 0.5) if rec else None
+        hid = rec["id"] if rec else None
+        combined = f"{origin}, {reason}" if origin else reason
         self._state[fp] = STATE_REVERTING
         self._handoffs.pop(fp, None)
-        self._log_transition(fp, STATE_REVERTING, None, rec["id"] if rec else None)
+        self._log_transition(fp, STATE_REVERTING, None, hid, combined)
         self._active_since = None
         if parked:
             self._restore_controller_cursor(fp, fraction)
@@ -1532,7 +1566,7 @@ class KVMEngine:
         self._restore_local_delegation()
         channel.send_event(KIND_ALL_KEYS_UP)
         self._state[fp] = STATE_LOCAL
-        self._log_transition(fp, STATE_LOCAL)
+        self._log_transition(fp, STATE_LOCAL, None, hid, combined)
         suffix = f" ({origin}, {reason})" if origin else f" ({reason})"
         self.on_status(f"Control returned from {channel.peer_name}{suffix}")
 
@@ -1544,14 +1578,15 @@ class KVMEngine:
             return
         rec = self._handoffs.get(fp)
         hid = rec["id"] if rec else None
+        combined = f"{origin}, {reason}" if origin else reason
         self._state[fp] = STATE_REVERTING
         self._handoffs.pop(fp, None)
-        self._log_transition(fp, STATE_REVERTING, None, hid)
+        self._log_transition(fp, STATE_REVERTING, None, hid, combined)
         self._active_since = None
         self._restore_local_delegation()
         self._release_all_keys()
         self._state[fp] = STATE_LOCAL
-        self._log_transition(fp, STATE_LOCAL)
+        self._log_transition(fp, STATE_LOCAL, None, hid, combined)
         suffix = f" ({origin}, {reason})" if origin else f" ({reason})"
         self.on_status(f"{channel.peer_name} released control{suffix}")
 
@@ -1836,7 +1871,7 @@ class KVMEngine:
             if state not in (None, STATE_LOCAL):
                 self._restore_local_delegation(attempts=2)
                 self._release_all_keys()
-                self._log_transition(fp, STATE_LOCAL, None, None)
+                self._log_transition(fp, STATE_LOCAL, None, None, "channel closed")
                 self.on_status(f"KVM channel with {channel.peer_name} lost - control returned")
             self._peer_layouts.pop(fp, None)
             self._peer_sides.pop(fp, None)
@@ -1863,9 +1898,9 @@ class KVMEngine:
                 return self._channels.get(fp)
         return None
 
-    def _cursor_side(self, x: int, y: int) -> str | None:
+    def _cursor_side(self, x: int, y: int, zone: int = JUMP_ZONE) -> str | None:
         try:
-            return in_jump_zone(self._my_layout(), x, y)
+            return in_jump_zone(self._my_layout(), x, y, zone)
         except KvmError:
             return None
 

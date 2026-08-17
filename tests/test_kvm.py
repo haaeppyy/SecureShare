@@ -298,6 +298,154 @@ def test_hand_back_on_local_pointer_input(node_pair_ctx):
     assert ok
 
 
+def test_handback_blocks_former_controller_edge(node_pair_ctx):
+    """A normal target-driven revert must latch the former controller's edge.
+
+    B's physical input hands control back; A's edge stays blocked while the
+    cursor remains near it (LATCH_ZONE), so residual motion cannot start a
+    fresh CONTROL_REQUEST.  Leaving the edge clears the latch, and a
+    deliberate re-entry is allowed again.
+    """
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    plat_b.move(1, 0)  # physical local input on the target -> revert
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    assert ok, "A never handed back control"
+    assert pair.b.kvm.control_state(pair.a.store.fingerprint()) == "local"
+    assert plat_b.delegation == "local"
+    assert pair.a.kvm._blocked_edge.get(fp_b) == "right", "revert must latch the edge"
+    # A wiggles at the restored seam position: no fresh request, A stays local.
+    plat_a.move(2, 0)  # (1435, 450) -> (1437, 450): inside the 3 px jump zone
+    assert pair.a.kvm._state.get(fp_b) == "local", "edge latch did not hold"
+    assert pair.a.kvm._handoffs.get(fp_b) is None
+    assert pair.b.kvm.control_state(pair.a.store.fingerprint()) == "local"
+    # Still close to the edge: more movement must not clear the latch.
+    plat_a.move(-1, 0)  # (1436, 450) -> still in the latch zone
+    assert pair.a.kvm._state.get(fp_b) == "local"
+    # Clearly leave the edge: the latch clears.
+    plat_a.move(-16, 0)  # -> (1420, 450): outside LATCH_ZONE
+    ok = wait_for(lambda: pair.a.kvm._blocked_edge.get(fp_b) is None, timeout=5)
+    assert ok, "leaving the edge must clear the latch"
+    assert pair.a.kvm._state.get(fp_b) == "local"
+    # Deliberate re-entry is a fresh handoff.
+    plat_a.move(20, 0)  # -> (1440, 450): back on the seam
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting", timeout=5)
+    assert ok, "deliberate re-entry must be allowed after the latch cleared"
+    assert pair.a.kvm.diagnostics()["blocked_edges"].get(fp_b) is None
+
+
+def test_reverse_direction_handoff_after_handback(node_pair_ctx):
+    """After B takes its control back, B can immediately cross to its own
+    edge and control A: the former-controller latch must not block the new
+    controller."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    fp_a = pair.a.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    plat_b.move(1, 0)  # B reclaims via physical input
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    assert ok
+    assert pair.a.kvm._blocked_edge.get(fp_b) == "right"
+    # B parks on its left seam (A sits at B's left edge).
+    plat_b.cursor = (700, 540)
+    plat_b.move(-700, 0)  # -> (0, 540): B's left jump zone
+    ok = wait_for(lambda: pair.b.kvm._state.get(fp_a) == "controlling", timeout=5)
+    assert ok, "B never took control of A"
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "remote", timeout=5)
+    assert ok, "A never entered remote"
+    assert plat_b.delegation == "controlling"
+    assert plat_a.delegation == "remote"
+
+
+def test_escape_latches_until_edge_exit_then_retake(node_pair_ctx):
+    """The escape chord restores both sides to local and latches the
+    former controller's edge too; a new handoff works after edge
+    exit/re-entry."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    for hid in (0x94, 0x96):
+        plat_a.press(hid)
+    plat_a.press(0x2C)  # ctrl+alt+space
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    assert ok
+    assert wait_for(lambda: plat_b.delegation == "local", timeout=5)
+    assert pair.a.kvm._blocked_edge.get(fp_b) == "right", "escape must latch the edge"
+    # Residual wiggle at the seam must not re-acquire.
+    plat_a.move(2, 0)
+    assert pair.a.kvm._state.get(fp_b) == "local"
+    # Exit the latch zone, then deliberately re-enter: handoff completes.
+    plat_a.move(-16, 0)  # -> (1421, 450)
+    ok = wait_for(lambda: pair.a.kvm._blocked_edge.get(fp_b) is None, timeout=5)
+    assert ok
+    plat_a.move(19, 0)  # -> (1440, 450)
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting", timeout=5)
+    assert ok
+    ok = wait_for(lambda: pair.a.kvm.platform.delegation == "controlling", timeout=5)
+    assert ok, "new handoff never completed after escape + exit/re-entry"
+
+
+def test_channel_loss_does_not_latch_and_recovers(node_pair_ctx):
+    """Channel loss must not leave a latch: it tears the per-peer state
+    down, so a fresh link can hand off again immediately."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    pair.a.kvm._channels[fp_b].close()
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) is None, timeout=5)
+    assert ok
+    assert pair.a.kvm._blocked_edge.get(fp_b) is None, "channel loss must not latch"
+    assert plat_a.delegation == "local"
+    # Re-link and complete a fresh handoff.
+    ok = wait_for(
+        lambda: fp_b in pair.a.kvm._channels and pair.a.store.fingerprint() in pair.b.kvm._channels,
+        timeout=20,
+    )
+    assert ok, "channel must re-establish after teardown"
+    ok = wait_for(lambda: pair.a.kvm.link_status(fp_b) == "ready", timeout=5)
+    assert ok, "screen info must be exchanged again before a fresh handoff"
+    plat_a.cursor = (700, 450)
+    plat_a.move(740, 0)  # -> (1440, 450)
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "controlling", timeout=5)
+    assert ok, "fresh handoff after channel loss failed"
+    assert plat_b.delegation == "remote"
+
+
+def test_controller_delegation_single_association_until_revert(node_pair_ctx):
+    """Problem A seam: the controller enters delegation exactly once and
+    stays there (no local re-association) while controlling; physical
+    movement is swallowed and forwarded only, never treated as a handback;
+    the single local restore happens on revert."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    base = len(plat_a.delegation_calls)  # ignore pre-takeover link-setup calls
+    take_control(pair, plat_a, plat_b)
+    assert plat_a.delegation_calls[base:] == ["controlling"], (
+        f"expected exactly one controlling delegation, got {plat_a.delegation_calls[base:]}"
+    )
+    # Physical movement while controlling is forwarded, never a handback.
+    for _ in range(5):
+        plat_a.move(2, 0)
+    wait_injected(plat_b, ("rel", 10, 0))  # coalesced into one frame
+    assert plat_a.delegation_calls[base:] == ["controlling"], (
+        "delegation must not change while controlling"
+    )
+    assert pair.a.kvm.control_state(fp_b) == "controlling"
+    # Peer revert: exactly one local restore.
+    plat_b.move(1, 0)
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    assert ok
+    assert plat_a.delegation_calls[base:] == ["controlling", "local"], (
+        f"revert must restore local exactly once, got {plat_a.delegation_calls[base:]}"
+    )
+
+
 def test_hand_back_releases_pressed_keys(node_pair_ctx):
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
@@ -889,7 +1037,10 @@ def test_f3_waiting_active_label_and_transition_log(node_pair_ctx):
     assert pair.a.kvm.control_label(fp_b) == "waiting_active"
     assert pair.a.kvm.control_label(pair.a.store.fingerprint()) == "local"
     assert len(pair.a.kvm.recent_transitions()) >= 3
-    assert any(stage == "waiting_active" for _, _, _s, stage, _h in pair.a.kvm.recent_transitions())
+    assert any(
+        stage == "waiting_active"
+        for _, _, _s, stage, _h, _r, _b in pair.a.kvm.recent_transitions()
+    )
 
 
 def test_f4_concurrent_callback_and_reader_traffic(node_pair_ctx):
@@ -935,7 +1086,9 @@ def test_f5_local_input_revert_reports_origin(node_pair_ctx):
     ok = wait_for(lambda: pair.a.kvm.control_state(pair.b.store.fingerprint()) == "local", timeout=5)
     assert ok, f"A never reverted; got {pair.a.kvm.control_state(pair.b.store.fingerprint())}"
 
-    plat_a.cursor = (700, 450)
+    # The revert latched A's edge: the cursor sits just inside the seam, so
+    # a fresh takeover needs a deliberate exit of the latch zone first.
+    plat_a.move(-700, 0)  # (1435, 450) -> (735, 450): clearly off the seam
     take_control(pair, plat_a, plat_b)
     pair.b.kvm._capture_origin = "win"
     plat_b.press(mac_vk_to_hid(0x00))
