@@ -32,6 +32,17 @@ not on PATH: `py -3.12 -m PyInstaller ...`.
 - [ ] Within ~15s both menus show "1 device(s), 0 paired" and the other
       machine's name appears under "Pair with device"
 
+## 2b. Right-click share (macOS)
+
+- [ ] Right-click a file -> Quick Actions/Services -> "Send to SecureShare"
+      (after `./scripts/embed_share_extension.sh` + lsregister)
+- [ ] Picker appears listing paired devices; picking one sends the file
+- [ ] Select 3 files -> ONE picker; all 3 send to the chosen device
+- [ ] Send while the app is NOT running -> app starts, picker appears
+- [ ] With a Developer ID signing identity: `SIGN_IDENTITY="Developer ID
+      Application: ..." ./scripts/embed_share_extension.sh` -> extension
+      also lists under Finder Share menu (macOS 26+ ignores ad-hoc)
+
 ## 3. Pairing
 
 - [ ] On A: "Pair with device" -> B's name -> PIN dialog appears
@@ -46,6 +57,17 @@ not on PATH: `py -3.12 -m PyInstaller ...`.
 - [ ] File lands in `%USERPROFILE%\Downloads\SecureShare`, sha256 matches
 - [ ] B sends a file to A: same result
 - [ ] Negative test: unpaired machine sends -> transfer refused
+
+## 4b. Right-click share (Windows)
+
+- [ ] `powershell -ExecutionPolicy Bypass -File scripts\install_windows_share.ps1`
+      ran; right-click any file shows "Send with SecureShare"
+- [ ] Right-click a file -> Send with SecureShare -> picker appears listing
+      paired devices; choosing one sends the file (sha256 matches)
+- [ ] Select 3 files -> Send with SecureShare -> ONE picker dialog appears;
+      picking a device sends all 3
+- [ ] Send while the app is NOT running -> the app starts, shows the picker
+- [ ] `uninstall_windows_share.ps1` removes the menu item
 
 ## 5. Clipboard sync (text)
 
@@ -94,8 +116,8 @@ Privacy & Security → Accessibility); the app toasts when it is missing.
 - [ ] Check the tray menu on B during takeover → B's entry under "Mouse &
       keyboard devices…" shows "controlled by peer"; on A it shows
       "controlling"
-- [ ] Move the cursor to B's left edge → control returns to B, cursor
-      reappears on A parked just inside the seam
+- [ ] Move the physical mouse, click, or scroll on B → control returns to B,
+      cursor reappears on A parked just inside the seam
 - [ ] Negative: while controlling, your keyboard input still reaches B
       instantly, but A's own mouse stops working (suppressed) only after
       the takeover was confirmed — no blind grabs
@@ -108,6 +130,12 @@ Privacy & Security → Accessibility); the app toasts when it is missing.
       dwell
 - [ ] Negative: disconnect A from the network mid-takeover → B regains
       local control and no stuck keys remain
+- [ ] Negative: while A controls B, move a third paired device C (consent
+      on) onto B's edge → B shows a "busy" error toast, and once A hands
+      back, C can take over immediately (no frozen state)
+- [ ] Negative: revoke Accessibility from the app mid-takeover → a key
+      press on A degrades without killing the session; restoring the
+      permission resumes injection
 - [ ] Negative: set A's seam for B to "Top" and B's seam for A to "Top"
       → both sides show a layout-mismatch toast and takeover is refused
       until fixed

@@ -118,8 +118,19 @@ CHANNEL_READ_TIMEOUT = 2.0
 STALL_TIMEOUT = 6.0
 KEEPALIVE_INTERVAL = 2.0
 HANDOFF_TIMEOUT = 1.5
+HANDSHAKE_TIMEOUT = 5.0
 MAX_FRAME = 1 << 20
 COUNTER_LIMIT = 1 << 31
+MAX_PENDING_KVM = 8        # concurrent unauthenticated opening connections
+MAX_PENDING_KVM_PER_IP = 4
+
+
+def _set_low_latency(conn) -> None:
+    """Disable Nagle buffering for latency-sensitive KVM events."""
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
 
 # Control states (per peer).
 STATE_LOCAL = "local"
@@ -153,7 +164,8 @@ class InputPlatform:
                     engine only watches for the seam edge
         controlling suppress input and forward it to the peer (entered
                     only after CONTROL_ACTIVE was confirmed)
-        remote      suppress and drop input except for the escape chord
+        remote      suppress forwarded input; a physical pointer move or
+                    button press releases control back to this device
 
     Injected events must never reach the capture callback again
     (self-injection filtering); the platform is responsible for that.
@@ -174,9 +186,6 @@ class InputPlatform:
 
     def screen_layout(self) -> ScreenLayout:
         raise NotImplementedError
-
-    def invalidate_layout(self) -> None:
-        """Drop any cached screen layout (display-change signal). Default no-op."""
 
     def cursor_position(self) -> tuple[int, int]:
         raise NotImplementedError
@@ -251,7 +260,7 @@ def validate_ack(ack: dict, my_fp: str, expected_peer: str, my_nonce8: bytes) ->
 class KvmChannel:
     """One encrypted binary event stream to a paired peer."""
 
-    def __init__(self, conn, peer_fp, peer_name, key, nonce8_out, nonce8_in, engine, role):
+    def __init__(self, conn, peer_fp, peer_name, key, nonce8_out, nonce8_in, engine, role, inbound_start=0):
         self.conn = conn
         self.peer_fp = peer_fp
         self.peer_name = peer_name
@@ -263,7 +272,7 @@ class KvmChannel:
         self._lock = threading.Lock()
         self.closed = False
         self._outbound = 0
-        self._inbound = 0
+        self._inbound = inbound_start  # responder pre-consumes frame 0 (key confirmation)
         self.last_inbound = time.monotonic()
         self._last_ping = 0.0
 
@@ -285,7 +294,15 @@ class KvmChannel:
 
     def run(self) -> None:
         """Blocking binary frame-read loop; runs in a dedicated thread or in
-        the server connection thread depending on which side initiated."""
+        the server connection thread depending on which side initiated.
+        engine_remove() is guaranteed via finally so a handler exception can
+        never leave the engine's per-peer state frozen."""
+        try:
+            self._run_loop()
+        finally:
+            self.engine_remove()
+
+    def _run_loop(self) -> None:
         self.conn.settimeout(CHANNEL_READ_TIMEOUT)
         while not self.closed:
             try:
@@ -314,8 +331,21 @@ class KvmChannel:
                 kind, body = unpack_event(plain)
             except ProtocolError:
                 break
-            self._engine.handle_event(self, kind, body)
-        self.engine_remove()
+            try:
+                self._engine.handle_event(self, kind, body)
+            except Exception as exc:
+                # A platform-layer failure handling one event must never kill
+                # this thread silently: that would freeze the per-peer engine
+                # state (on_channel_closed, the only reset, runs after this
+                # loop). Contain the event and keep the session alive; the
+                # finally in run() remains the teardown net for read-level
+                # failures.
+                try:
+                    self._engine.on_status(
+                        f"KVM: error handling event: {exc}", level="error"
+                    )
+                except Exception:
+                    pass
 
     def engine_remove(self) -> None:
         self._engine.on_channel_closed(self)
@@ -340,12 +370,17 @@ class KVMEngine:
         self.discovery = discovery
         self.platform = platform
         self.relay = relay  # optional: (fp, kind, body) echo back for tests
-        self.on_status = on_status or (lambda s: None)
+        self.on_status = on_status or (lambda s, level="info": None)
         self.enabled = bool(store.kvm_enabled)
         self.stall_timeout = STALL_TIMEOUT
         self.keepalive_interval = KEEPALIVE_INTERVAL
         self.handoff_timeout = HANDOFF_TIMEOUT
         self._channels: dict[str, KvmChannel] = {}
+        # Unauthenticated opening connections: admitted only after the
+        # first binary frame decrypts (key confirmation). A pending entry
+        # can never displace an active channel.
+        self._pending: list[dict] = []  # {"conn", "fp", "addr", "deadline"}
+        self._pending_by_ip: dict[str, int] = {}
         # Control state machine per peer (see STATE_*).
         self._state: dict[str, str] = {}
         # In-flight handoff records per peer:
@@ -409,7 +444,8 @@ class KVMEngine:
             if not self._perm_notified:
                 self._perm_notified = True
                 self.on_status(
-                    f"Mouse & keyboard sharing needs permission: {detail or exc}"
+                    f"Mouse & keyboard sharing needs permission: {detail or exc}",
+                    level="error",
                 )
             return False
 
@@ -488,6 +524,7 @@ class KVMEngine:
     # -- inbound (from Node._on_other) ----------------------------------------
 
     def on_inbound(self, conn, header, header_bytes, addr) -> None:
+        _set_low_latency(conn)
         fp = header.get("fp", "")
         peer = self.store.get_peer(fp) if validate_open(header) else None
         if peer is None or not self.enabled:
@@ -496,25 +533,22 @@ class KVMEngine:
             except OSError:
                 pass
             return
-        with self._lock:
-            old = self._channels.get(fp)
-            if old is not None:
-                old.close()
-            if self._edge_claimed(fp):
-                try:
-                    send_frame(conn, {"type": "error", "code": "kvm_edge_busy"})
-                except OSError:
-                    pass
-                return
+        if not self._admit_pending(conn, fp, addr):
+            try:
+                send_frame(conn, {"type": "error", "code": "kvm_busy"})
+            except OSError:
+                pass
+            return
+        try:
+            # Challenge/response: derive the channel key from the open and
+            # demand the first binary frame (key confirmation) NOW, while
+            # the current channel stays untouched.
             my_nonce8 = os.urandom(crypto.CHUNK_NONCE_PREFIX_BYTES)
             peer_nonce8 = base64.b64decode(header["nonce8"])
             key = kvm_channel_key(
                 peer["trust_key"], KVM_PROTOCOL_VERSION, fp, self.store.fingerprint(), peer_nonce8, my_nonce8
             )
-            ch = KvmChannel(conn, fp, peer.get("name", fp[:8]), key, my_nonce8, peer_nonce8, self, "responder")
-            self._channels[fp] = ch
-            self._link_status[fp] = LINK_LINKED
-        try:
+            conn.settimeout(HANDSHAKE_TIMEOUT)
             send_frame(
                 conn,
                 {
@@ -525,12 +559,78 @@ class KVMEngine:
                     "nonce8": base64.b64encode(my_nonce8).decode("ascii"),
                 },
             )
-        except OSError:
-            self.on_channel_closed(ch)
+            raw = recv_frame(conn)
+            nonce = crypto.chunk_nonce(peer_nonce8, 0)
+            plain = crypto.decrypt_with_nonce(key, nonce, raw)
+            confirmed_kind, confirmed_body = unpack_event(plain)
+        except (OSError, ProtocolError, ValueError, InvalidTag):
+            try:
+                send_frame(conn, {"type": "error", "code": "kvm_auth_failed"})
+            except OSError:
+                pass
             return
+        finally:
+            self._release_pending(conn)
+        # Authenticated: only now may the current valid channel be replaced.
+        with self._lock:
+            old = self._channels.get(fp)
+            if old is not None:
+                old.close()
+            if self._edge_claimed(fp):
+                try:
+                    send_frame(conn, {"type": "error", "code": "kvm_edge_busy"})
+                except OSError:
+                    pass
+                return
+            ch = KvmChannel(
+                conn,
+                fp,
+                peer.get("name", fp[:8]),
+                key,
+                my_nonce8,
+                peer_nonce8,
+                self,
+                "responder",
+                inbound_start=1,
+            )
+            self._channels[fp] = ch
+            self._link_status[fp] = LINK_LINKED
+        # Dispatch the key-confirmation frame (the peer's screen info).
+        self.handle_event(ch, confirmed_kind, confirmed_body)
         self._send_screen_info(ch)
         self.on_status(f"KVM linked with {ch.peer_name}")
         ch.run()
+
+    def _admit_pending(self, conn, fp: str, addr: tuple) -> bool:
+        """Admit an opening connection under the pending caps."""
+        with self._lock:
+            if len(self._pending) >= MAX_PENDING_KVM:
+                return False
+            if self._pending_by_ip.get(addr[0], 0) >= MAX_PENDING_KVM_PER_IP:
+                return False
+            self._pending.append(
+                {
+                    "conn": conn,
+                    "fp": fp,
+                    "addr": addr,
+                    "deadline": time.monotonic() + HANDSHAKE_TIMEOUT,
+                }
+            )
+            self._pending_by_ip[addr[0]] = self._pending_by_ip.get(addr[0], 0) + 1
+            return True
+
+    def _release_pending(self, conn) -> None:
+        with self._lock:
+            for i, entry in enumerate(self._pending):
+                if entry["conn"] is conn:
+                    del self._pending[i]
+                    ip = entry["addr"][0]
+                    n = self._pending_by_ip.get(ip, 0)
+                    if n <= 1:
+                        self._pending_by_ip.pop(ip, None)
+                    else:
+                        self._pending_by_ip[ip] = n - 1
+                    return
 
     def _edge_claimed(self, fp: str) -> bool:
         side = self._my_side_for(fp)
@@ -563,9 +663,11 @@ class KVMEngine:
                 continue  # the other side initiates
             with self._lock:
                 self._link_status[fp] = LINK_CONNECTING
+            conn = None
             try:
                 conn = socket.create_connection((peer.host, peer.port), timeout=10)
-                conn.settimeout(15)
+                _set_low_latency(conn)
+                conn.settimeout(HANDSHAKE_TIMEOUT)
                 my_nonce8 = os.urandom(crypto.CHUNK_NONCE_PREFIX_BYTES)
                 send_frame(
                     conn,
@@ -579,10 +681,11 @@ class KVMEngine:
                 raw = recv_frame(conn)
                 ack = json.loads(raw.decode("utf-8"))
             except Exception:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
                 with self._lock:
                     if fp not in self._channels:
                         self._link_status[fp] = LINK_ERROR
@@ -630,10 +733,27 @@ class KVMEngine:
                 continue
             now = time.monotonic()
             with self._lock:
-                for fp, rec in list(self._handoffs.items()):
-                    deadline = rec.get("deadline")
+                for rec in list(self._handoffs.items()):
+                    deadline = rec[1].get("deadline")
                     if deadline and now >= deadline:
-                        self._expire_handoff(fp, rec)
+                        self._expire_handoff(rec[0], rec[1])
+                self._sweep_pending(now)
+
+    def _sweep_pending(self, now: float) -> None:
+        """Expire stalled opening connections; they never touch _channels."""
+        stale = [e for e in self._pending if e["deadline"] <= now]
+        for entry in stale:
+            try:
+                entry["conn"].close()
+            except OSError:
+                pass
+            self._pending.remove(entry)
+            ip = entry["addr"][0]
+            n = self._pending_by_ip.get(ip, 0)
+            if n <= 1:
+                self._pending_by_ip.pop(ip, None)
+            else:
+                self._pending_by_ip[ip] = n - 1
 
     def _expire_handoff(self, fp: str, rec: dict) -> None:
         ch = self._channels.get(fp)
@@ -642,34 +762,11 @@ class KVMEngine:
                 ch.send_event(KIND_CONTROL_CANCEL, encode_handoff_message(rec["id"], "timeout"))
             except Exception:
                 pass
-        if ch is not None and not ch.closed:
-            if rec["role"] == "controller":
-                self._blocked_edge[fp] = self._my_side_for(fp)
-                self._revert_control(ch, "handoff timeout")
-            else:
-                self._revert_remote(ch, "handoff timeout")
-            return
-        # The channel is already gone: nothing can be notified, but the
-        # local control state must not linger. Otherwise the watchdog
-        # re-expires this same handoff every 200 ms and the state stays
-        # stuck in requesting/remote_preparing.
-        self._state.pop(fp, None)
-        self._handoffs.pop(fp, None)
-        self._blocked_edge.pop(fp, None)
-        self._last_sent_id.pop(fp, None)
-        if rec.get("role") == "controller" and rec.get("parked"):
-            self._restore_controller_cursor(fp, rec.get("fraction", 0.5))
-        try:
-            self._set_delegation_local()
-        except Exception:
-            pass
-        if self.platform is not None:
-            try:
-                self.platform.show_cursor()
-            except Exception:
-                pass
-        self._release_all_keys()
-        self.on_status("KVM handoff timed out - control returned to local")
+        if rec["role"] == "controller":
+            self._blocked_edge[fp] = self._my_side_for(fp)
+            self._revert_control(ch, "handoff timeout")
+        else:
+            self._revert_remote(ch, "handoff timeout")
 
     # -- platform callbacks (capture side) ------------------------------------
 
@@ -720,12 +817,47 @@ class KVMEngine:
             if cursor_side is None or cursor_side != self._my_side_for(fp):
                 self._cancel_outbound(fp, "edge-left")
             return
+        if state == STATE_REMOTE:
+            self.on_remote_local_input()
+
+    def on_remote_local_input(self) -> None:
+        """Release a peer's control after physical pointer input here.
+
+        The controlled device is independent again after a local mouse move,
+        click, or scroll.  In particular, injected pointer motion reaching a
+        screen edge must *not* hand control back, or the two sides repeatedly
+        bounce control as the cursor is clamped to that edge.
+        """
+        channel = self._active_channel()
+        if channel is None:
+            return
+        fp = channel.peer_fp
+        if self._state.get(fp) != STATE_REMOTE:
+            return
+        rec = self._handoffs.get(fp)
+        if rec is None:
+            return
+        try:
+            self.on_status(f"KVM DEBUG: sending CONTROL_REVERT id={rec['id']}", level="error")
+        except Exception:
+            pass
+        try:
+            channel.send_event(KIND_CONTROL_REVERT, encode_handoff_message(rec["id"], "local-input"))
+        except Exception as exc:
+            try:
+                self.on_status(f"KVM DEBUG: send failed: {exc}", level="error")
+            except Exception:
+                pass
+        self._revert_remote(channel, "local pointer input")
 
     def on_local_button(self, button: int, down: bool) -> None:
         channel = self._active_channel()
         if channel is None:
             return
         fp = channel.peer_fp
+        if self._state.get(fp) == STATE_REMOTE:
+            self.on_remote_local_input()
+            return
         rec = self._handoffs.get(fp)
         if self._state.get(fp) != STATE_CONTROLLING or rec is None or rec.get("stage") != "active":
             return
@@ -736,6 +868,9 @@ class KVMEngine:
         if channel is None:
             return
         fp = channel.peer_fp
+        if self._state.get(fp) == STATE_REMOTE:
+            self.on_remote_local_input()
+            return
         rec = self._handoffs.get(fp)
         if self._state.get(fp) != STATE_CONTROLLING or rec is None or rec.get("stage") != "active":
             return
@@ -743,6 +878,15 @@ class KVMEngine:
 
     def on_local_key(self, hid: int, down: bool) -> None:
         if not self.enabled or self.platform is None:
+            return
+        # A real key press on the controlled device is an explicit request to
+        # reclaim it, just like moving its physical mouse.  The event that
+        # triggers the release may be swallowed by the platform; subsequent
+        # keys go to the now-local device normally.
+        channel = self._active_channel()
+        if channel is not None and self._state.get(channel.peer_fp) == STATE_REMOTE:
+            if down:
+                self.on_remote_local_input()
             return
         if hid_is_modifier(hid):
             self._update_local_mask(hid, down)
@@ -827,10 +971,6 @@ class KVMEngine:
     def on_display_change(self) -> None:
         if not self.enabled or self.platform is None:
             return
-        try:
-            self.platform.invalidate_layout()
-        except Exception:
-            pass
         for ch in list(self._channels.values()):
             self._send_screen_info(ch)
 
@@ -843,7 +983,7 @@ class KVMEngine:
     def _request_control(self, channel: KvmChannel, tx: int, ty: int, fraction: float) -> None:
         fp = channel.peer_fp
         if not self._topology_ok.get(fp, True):
-            self.on_status(f"KVM with {channel.peer_name}: screen layout mismatch")
+            self.on_status(f"KVM with {channel.peer_name}: screen layout mismatch", level="error")
             return
         if self._active_channel() is not None:
             return
@@ -979,17 +1119,6 @@ class KVMEngine:
         rec = self._handoffs.get(fp)
         if rec is not None and rec["id"] == hid:
             return  # duplicate of the in-flight attempt
-        state = self._state.get(fp, STATE_LOCAL)
-        if state != STATE_LOCAL:
-            # One active control at a time. Simultaneous takeover: the
-            # higher fingerprint wins (deterministic tiebreak). The
-            # loser withdraws its own request (a withdrawal must not be
-            # mistaken for a refusal: the winner's request stays alive).
-            if state == STATE_REQUESTING and self.store.fingerprint() < fp:
-                self._cancel_outbound(fp, "withdrawn")
-            else:
-                self._refuse(channel, hid, "busy")
-                return
         if fp in self._denial_latch:
             # The pointer is still on the rejected edge; stay silent
             # until the controller cancels / leaves the edge.
@@ -1003,13 +1132,24 @@ class KVMEngine:
             self._denial_latch[fp] = "topology"
             self._refuse(channel, hid, "topology")
             return
+        state = self._state.get(fp, STATE_LOCAL)
+        if state != STATE_LOCAL:
+            # One active control at a time. Simultaneous takeover: the
+            # higher fingerprint wins (deterministic tiebreak). The
+            # loser withdraws its own request (a withdrawal must not be
+            # mistaken for a refusal: the winner's request stays alive).
+            if state == STATE_REQUESTING and self.store.fingerprint() < fp:
+                self._cancel_outbound(fp, "withdrawn")
+            else:
+                self._refuse(channel, hid, "busy", f"{channel.peer_name} is busy")
+                return
         if self.platform is None:
             self._refuse(channel, hid, "unavailable")
             return
         if channel.closed:
             return
         if any(s != STATE_LOCAL for s in self._state.values()):
-            self._refuse(channel, hid, "busy")
+            self._refuse(channel, hid, "busy", f"{channel.peer_name} is busy")
             return
         self._handoffs[fp] = {
             "id": hid,
@@ -1030,7 +1170,7 @@ class KVMEngine:
         except Exception:
             pass
         if message:
-            self.on_status(f"KVM: {message}")
+            self.on_status(f"KVM: {message}", level="error")
 
     # -- handoff: cancellation / revert (both roles) ---------------------------
 
@@ -1065,7 +1205,21 @@ class KVMEngine:
         fp = channel.peer_fp
         rec = self._handoffs.get(fp)
         if rec is None or rec["id"] != hid:
+            try:
+                self.on_status(
+                    f"KVM DEBUG: revert id={hid} rejected as stale, rec={rec}",
+                    level="error",
+                )
+            except Exception:
+                pass
             return  # stale
+        try:
+            self.on_status(
+                f"KVM DEBUG: revert id={hid} accepted, state={self._state.get(fp)}",
+                level="error",
+            )
+        except Exception:
+            pass
         state = self._state.get(fp, STATE_LOCAL)
         reason = reason or "peer"
         if state in (STATE_REMOTE, STATE_REMOTE_PREPARING):
@@ -1193,7 +1347,7 @@ class KVMEngine:
             code, message = decode_error(body)
             fp = channel.peer_fp
             self._blocked_edge[fp] = self._my_side_for(fp)
-            self.on_status(f"KVM: {channel.peer_name} refused: {message or code}")
+            self.on_status(f"KVM: {channel.peer_name} refused: {message or code}", level="error")
             self._revert_control(channel, "peer refused")
             return
         if kind == KIND_CONTROL_REQUEST:
@@ -1245,7 +1399,8 @@ class KVMEngine:
         if changed and not ok:
             self.on_status(
                 f"KVM layout mismatch with {channel.peer_name}: "
-                f"'{my_side}' vs their '{peer_side}' - fix in the menu"
+                f"'{my_side}' vs their '{peer_side}' - fix in the menu",
+                level="error",
             )
             rec = self._handoffs.get(fp)
             if rec is not None:
@@ -1314,13 +1469,16 @@ class KVMEngine:
                 self.pressed.discard(hid)
             elif kind == KIND_MODIFIERS:
                 self._apply_modifiers(decode_modifiers(body))
-        except ProtocolError:
-            pass
+        except Exception:
+            pass  # a single bad inject (ctypes/Quartz hiccup) must not kill the channel
 
     def _apply_modifiers(self, mask: int) -> None:
-        for hid in modifier_hids_for_mask(mask ^ self.modifier_mask):
-            self.platform.inject_key(hid, bool(mask & self.modifier_mask_hid_bit(hid)))
-        self.modifier_mask = mask
+        try:
+            for hid in modifier_hids_for_mask(mask ^ self.modifier_mask):
+                self.platform.inject_key(hid, bool(mask & self.modifier_mask_hid_bit(hid)))
+            self.modifier_mask = mask
+        except Exception:
+            pass
 
     @staticmethod
     def modifier_mask_hid_bit(hid: int) -> int:
@@ -1332,11 +1490,17 @@ class KVMEngine:
         if self.platform is None:
             return
         for hid in sorted(self.pressed):
-            self.platform.inject_key(hid, False)
+            try:
+                self.platform.inject_key(hid, False)
+            except Exception:
+                pass
         self.pressed.clear()
         if self.modifier_mask:
             for hid in modifier_hids_for_mask(self.modifier_mask):
-                self.platform.inject_key(hid, False)
+                try:
+                    self.platform.inject_key(hid, False)
+                except Exception:
+                    pass
             self.modifier_mask = 0
 
     def on_channel_closed(self, channel: KvmChannel) -> None:

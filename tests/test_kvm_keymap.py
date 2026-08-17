@@ -94,3 +94,6 @@ def test_modifiers():
 
 def test_escape_chord():
     assert ESCAPE_CHORD_HID == {0x94, 0x96, 0x2C}
+
+
+pytestmark = pytest.mark.unit

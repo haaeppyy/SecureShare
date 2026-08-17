@@ -72,5 +72,19 @@ app = BUNDLE(
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription": "",
         "LSMinimumSystemVersion": "11.0",
+        "CFBundleURLTypes": [
+            {
+                "CFBundleURLName": "com.secureshare.app",
+                "CFBundleURLSchemes": ["secureshare"],
+            }
+        ],
+        "NSServices": [
+            {
+                "NSMenuItem": {"default": "Send to SecureShare"},
+                "NSMessage": "sendFile",
+                "NSSendTypes": ["public.data"],
+                "NSServiceDescription": "Send a file to a paired SecureShare device",
+            }
+        ],
     },
 )

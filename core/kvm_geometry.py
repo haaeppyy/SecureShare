@@ -14,11 +14,12 @@ v1: seams are computed against the union bounds of all local monitors,
 which is exact for the single-monitor case.
 """
 
-import threading
-import time
-
 SIDES = ("left", "right", "top", "bottom")
 JUMP_ZONE = 3  # px from an edge that counts as reaching for the neighbor
+# A handoff must begin visibly inside the receiving display.  Starting only
+# one jump-zone past the edge makes residual motion from the crossing clamp
+# the cursor back to that edge before the user can steer it.
+ENTRY_INSET = 48
 
 
 class GeometryError(Exception):
@@ -170,7 +171,7 @@ def entry_point(peer_layout: ScreenLayout, my_side: str, fraction: float) -> tup
     return only happens after the user intentionally moves back to the edge.
     """
     x, y = map_to_peer(peer_layout, my_side, fraction)
-    inset = JUMP_ZONE + 1
+    inset = ENTRY_INSET
     peer_side = opposite_side(my_side)
     if peer_side == "left":
         x = min(peer_layout.right() - 1, x + inset)
@@ -207,37 +208,6 @@ def return_point(layout: ScreenLayout, my_side: str, fraction: float) -> tuple[i
 def verify_topology(my_side: str, peer_side: str) -> bool:
     """Consistent iff both sides point the same pair of edges at each other."""
     return opposite_side(my_side) == peer_side
-
-
-class ScreenLayoutCache:
-    """TTL cache around a layout-computing callable.
-
-    Hot paths (return-seam detection at injection time, seam-fraction math
-    on every local mouse move) call screen_layout() at hundreds of hertz;
-    the underlying enumeration (NSScreen.screens() / EnumDisplayMonitors)
-    is far too expensive for that. ``invalidate()`` is wired to display
-    change notifications; the TTL is only a fallback in case a
-    notification is ever missed.
-    """
-
-    def __init__(self, compute, max_age_s: float = 2.0):
-        self._compute = compute
-        self._max_age_s = max_age_s
-        self._lock = threading.Lock()
-        self._cached: ScreenLayout | None = None
-        self._cached_at = 0.0
-
-    def get(self) -> ScreenLayout:
-        now = time.monotonic()
-        with self._lock:
-            if self._cached is None or now - self._cached_at > self._max_age_s:
-                self._cached = self._compute()
-                self._cached_at = now
-            return self._cached
-
-    def invalidate(self) -> None:
-        with self._lock:
-            self._cached = None
 
 
 def pt_to_px(v: int, scale: float) -> int:

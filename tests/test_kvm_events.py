@@ -1,4 +1,5 @@
 import pytest
+import socket
 
 from core.kvm_events import (
     EDGE_BOTTOM,
@@ -177,3 +178,21 @@ def test_all_kinds_mapped():
 
     for kind in ke.KINDS:
         assert pack_event(kind) == bytes([kind])
+
+
+def test_kvm_channels_disable_nagle_buffering():
+    from core.kvm import _set_low_latency
+
+    class Socket:
+        def __init__(self):
+            self.options = []
+
+        def setsockopt(self, level, option, value):
+            self.options.append((level, option, value))
+
+    conn = Socket()
+    _set_low_latency(conn)
+    assert conn.options == [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
+
+
+pytestmark = pytest.mark.unit

@@ -64,6 +64,25 @@ def write(text: str | None = None, image_png: bytes | None = None) -> None:
         _safe_copy(text)
 
 
+def change_count() -> int | None:
+    """Cheap monotonic clipboard revision counter where the OS provides one
+    (macOS NSPasteboard changeCount, Windows GetClipboardSequenceNumber);
+    None elsewhere. Lets the sync watcher skip the expensive full read
+    when nothing has changed."""
+    mod = None
+    if sys.platform == "darwin":
+        from . import clipboard_mac as mod
+    elif sys.platform == "win32":
+        from . import clipboard_win as mod
+    fn = getattr(mod, "change_count", None) if mod is not None else None
+    if fn is None:
+        return None
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
 def _safe_paste() -> str:
     try:
         return pyperclip.paste()

@@ -12,6 +12,8 @@ from core.node import Node
 
 from conftest import node_pair  # noqa: F401
 
+import pytest
+
 
 def test_happy_path_pairing(node_pair):
     session_a, session_b = node_pair.pair()
@@ -138,3 +140,5 @@ def test_deny_before_accept(tmp_path):
     finally:
         pair_a.stop()
         pair_b.stop()
+
+pytestmark = pytest.mark.socket

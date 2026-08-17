@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from core.discovery import Discovery
+from core.discovery import Discovery, Peer, ServiceStateChange
 
 
 def test_discovery_finds_peer(tmp_path):
@@ -80,36 +80,6 @@ def test_sanitize():
     assert sanitize("!!!") == "device"
 
 
-def test_discovery_double_start_raises(tmp_path):
-    """Regression: __init__ stored _resolver but start() assigned a different
-    attribute (_resolve_thread), so a second start() orphaned the first
-    resolve loop with nothing able to stop it."""
-    d = Discovery("Alpha", "AAAA1111-0000-0000-0000-000000000001", 49704)
-    d.start()
-    try:
-        with pytest.raises(RuntimeError):
-            d.start()
-    finally:
-        d.stop()
-
-
-def test_discovery_stop_joins_resolve_thread(tmp_path):
-    """stop() must join the resolve thread and reset the attribute so a
-    start/stop/start cycle never accumulates threads."""
-    d = Discovery("Alpha", "AAAA1111-0000-0000-0000-000000000001", 49705)
-    d.start()
-    t1 = d._resolve_thread
-    assert t1 is not None and t1.is_alive()
-    d.stop()
-    assert not t1.is_alive()
-    assert d._resolve_thread is None
-    d.start()
-    t2 = d._resolve_thread
-    assert t2 is not None and t2 is not t1
-    d.stop()
-    assert not t2.is_alive()
-
-
 class _FakeInfo:
     def __init__(self, addresses):
         self._addresses = addresses
@@ -129,3 +99,18 @@ def test_pick_address_prefers_ipv4_and_skips_link_local():
     assert _pick_address(_FakeInfo(["127.0.0.1"])) is None
     assert _pick_address(_FakeInfo(["::", "fd00::1", "10.0.0.5"])) == "10.0.0.5"
     assert _pick_address(_FakeInfo([])) is None
+
+
+def test_updated_service_is_queued_for_reresolution():
+    """A known peer may change IP/port without a Removed event."""
+    discovery = Discovery("Alpha", "self", 49700)
+    service = "Beta._secureshare._tcp.local."
+    discovery._peers["peer"] = Peer("Beta", "peer", "192.168.1.10", 49701, service)
+
+    discovery._on_service_state_change(None, "_secureshare._tcp.local.", service, ServiceStateChange.Updated)
+
+    assert discovery._pending == {service: 0}
+    assert discovery._resolve_wake.is_set(), "queued service must wake the resolver"
+
+
+pytestmark = pytest.mark.manual

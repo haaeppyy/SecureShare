@@ -15,6 +15,7 @@ NONCE_LENGTH = 12
 TRUST_INFO = b"secureshare-trust-v1"
 TRANSFER_INFO = b"secureshare-transfer-v1"
 SYNC_INFO = b"secureshare-sync-v1"
+SYNC_CHANNEL_INFO = b"secureshare-sync-channel-v1"
 KVM_INFO = b"secureshare-kvm-v1"
 _KDF_SALT = b"SecureShare-v1"
 
@@ -45,6 +46,16 @@ def derive_transfer_key(trust_key: bytes, nonce8: bytes) -> bytes:
 def derive_sync_key(trust_key: bytes, nonce: bytes) -> bytes:
     """Per-message key for the clipboard sync channel."""
     return _hkdf(trust_key, nonce, SYNC_INFO)
+
+
+def derive_sync_channel_key(trust_key: bytes, salt: bytes) -> bytes:
+    """Per-channel key for a clipboard sync connection.
+
+    ``salt`` must bind protocol version, both fingerprints, the role and
+    both channel nonces, so a spoofed open produces a key the peer cannot
+    derive (the first sealed frame is the key confirmation).
+    """
+    return _hkdf(trust_key, salt, SYNC_CHANNEL_INFO)
 
 
 def derive_kvm_channel_key(trust_key: bytes, salt: bytes) -> bytes:

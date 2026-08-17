@@ -18,14 +18,17 @@ streamed end to end, keeping memory use flat regardless of file size.
 import base64
 import json
 import os
+import shutil
 import socket
 import struct
+import tempfile
 import threading
 import time
 
 from cryptography.exceptions import InvalidTag
 
 from . import crypto
+from .limits import ConnectionLimiter, address_allowed, parse_subnets
 from .trust_store import TrustStore
 
 MAX_HEADER = 1 << 20  # 1 MiB
@@ -34,6 +37,9 @@ CHUNK_SIZE = 1 << 20  # 1 MiB default
 GCM_OVERHEAD = 16     # AES-GCM auth tag bytes
 DEFAULT_PORT = 48620
 SOCK_TIMEOUT = 30.0
+MAX_TRANSFER_SIZE = 10 * (1 << 30)  # 10 GiB default cap
+MIN_FREE_SPACE = 1 << 20             # 1 MiB free-space margin
+_PATH_LOCK = threading.Lock()
 
 
 class ProtocolError(Exception):
@@ -178,10 +184,15 @@ class TransferServer:
         on_transfer_complete=None,
         on_error=None,
         on_other=None,
+        max_transfer_size: int | None = None,
+        trusted_subnets=None,
     ):
         self.store = store
         self.port = port
         self.download_dir = download_dir or default_download_dir()
+        self.max_transfer_size = max_transfer_size if max_transfer_size is not None else MAX_TRANSFER_SIZE
+        self.trusted_subnets = parse_subnets(trusted_subnets)
+        self.limiter = ConnectionLimiter()
         self.on_transfer_start = on_transfer_start or (lambda info: None)
         self.on_progress = on_progress or (lambda info, received, total: None)
         self.on_transfer_complete = on_transfer_complete or (lambda info: None)
@@ -190,6 +201,8 @@ class TransferServer:
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._claimed: set[str] = set()  # final paths reserved by in-flight transfers
+        self._claim_lock = threading.Lock()
 
     def start(self) -> int:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -233,6 +246,12 @@ class TransferServer:
                 continue
             except OSError:
                 break
+            # This listener also carries KVM and clipboard channels.  Keep
+            # interactive control frames out of Nagle's small-write buffer.
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             threading.Thread(
                 target=self._handle_connection,
                 args=(conn, addr),
@@ -244,7 +263,37 @@ class TransferServer:
         conn.settimeout(SOCK_TIMEOUT)
         owned = False
         try:
-            header_bytes = recv_frame(conn)
+            if not address_allowed(addr, self.trusted_subnets):
+                try:
+                    send_frame(
+                        conn,
+                        {"type": "error", "code": "refused", "message": "connection not allowed"},
+                    )
+                except OSError:
+                    pass
+                return
+            if not self.limiter.enter(addr):
+                try:
+                    send_frame(
+                        conn,
+                        {"type": "error", "code": "busy", "message": "too many connections"},
+                    )
+                except OSError:
+                    pass
+                return
+            try:
+                if not self.limiter.allow_request(addr):
+                    try:
+                        send_frame(
+                            conn,
+                            {"type": "error", "code": "rate_limited", "message": "too many requests"},
+                        )
+                    except OSError:
+                        pass
+                    return
+                header_bytes = recv_frame(conn)
+            finally:
+                self.limiter.leave(addr)
             header = json.loads(header_bytes.decode("utf-8"))
             mtype = header.get("type")
             if mtype == "transfer":
@@ -297,64 +346,119 @@ class TransferServer:
         if len(nonce8) != crypto.CHUNK_NONCE_PREFIX_BYTES:
             send_frame(conn, {"type": "error", "code": "bad_header", "message": "bad nonce"})
             return
+        if size > self.max_transfer_size:
+            send_frame(
+                conn,
+                {"type": "error", "code": "too_large", "message": "transfer exceeds the maximum allowed size"},
+            )
+            return
+        try:
+            free = shutil.disk_usage(self.download_dir).free
+        except OSError:
+            free = 0
+        if free < size + MIN_FREE_SPACE:
+            send_frame(
+                conn,
+                {"type": "error", "code": "no_space", "message": "not enough free disk space"},
+            )
+            return
 
         key = crypto.derive_transfer_key(peer["trust_key"], nonce8)
-        out_path = os.path.join(self.download_dir, name)
+        # Reserve a final path that does not exist yet (suffix -1, -2, ...
+        # on collision). The claim keeps two concurrent same-name transfers
+        # from racing to the same final path. It is released on every exit
+        # path via the outer finally.
         os.makedirs(self.download_dir, exist_ok=True)
-        self.on_transfer_start(
-            {
-                "name": name,
+        out_path = self._reserve_path(name)
+        try:
+            info = {
+                "name": os.path.basename(out_path),
                 "size": size,
                 "from": peer.get("name", fingerprint[:8]),
                 "fingerprint": fingerprint,
             }
-        )
-        received = 0
-        index = 0
+            self.on_transfer_start(info)
+            # Write to a unique temporary file in the same directory, then
+            # atomically rename it to out_path only after every chunk has
+            # been authenticated and the received size matches. A failure
+            # deletes only the temporary file - a pre-existing file at
+            # out_path is never opened or removed (out_path is guaranteed
+            # not to exist).
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(out_path)}.part-", dir=self.download_dir
+            )
+            received = 0
+            index = 0
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    while received < size:
+                        (chunk_len,) = struct.unpack(">Q", recv_exact(conn, 8))
+                        if chunk_len == 0 or chunk_len > chunk_size + GCM_OVERHEAD or chunk_len > MAX_CHUNK:
+                            raise ProtocolError("invalid chunk length")
+                        ct = recv_exact(conn, chunk_len)
+                        nonce = crypto.chunk_nonce(nonce8, index)
+                        try:
+                            block = crypto.decrypt_with_nonce(key, nonce, ct, aad=header_bytes)
+                        except InvalidTag:
+                            raise AuthFailedError("chunk authentication failed")
+                        if len(block) > chunk_size:
+                            raise ProtocolError("chunk larger than declared")
+                        out.write(block)
+                        received += len(block)
+                        if received > size:
+                            raise ProtocolError("received more data than declared")
+                        index += 1
+                        self.on_progress(info, received, size)
+                    out.flush()
+                    os.fsync(out.fileno())
+            except (ProtocolError, InvalidTag):
+                self._cleanup_tmp(tmp_path)
+                send_frame(conn, {"type": "error", "code": "auth_failed", "message": "transfer failed"})
+                raise
+            if received != size:
+                self._cleanup_tmp(tmp_path)
+                send_frame(conn, {"type": "error", "code": "short", "message": "transfer ended early"})
+                raise ProtocolError("transfer ended early")
+            try:
+                os.replace(tmp_path, out_path)
+            except OSError as exc:
+                self._cleanup_tmp(tmp_path)
+                send_frame(conn, {"type": "error", "code": "write_failed", "message": "could not write file"})
+                raise ProtocolError(f"could not write {out_path}: {exc}") from exc
+            send_frame(conn, {"type": "ok", "bytes": received})
+            self.on_transfer_complete(
+                {
+                    "name": os.path.basename(out_path),
+                    "size": received,
+                    "path": out_path,
+                    "fingerprint": fingerprint,
+                }
+            )
+        finally:
+            self._release_path(out_path)
+
+    def _reserve_path(self, name: str) -> str:
+        """Final path that does not exist and is not claimed by another
+        transfer in flight; appends -1, -2, ... until free."""
+        name = os.path.basename(name)
+        base, ext = os.path.splitext(name)
+        with self._claim_lock:
+            candidate = os.path.join(self.download_dir, name)
+            index = 1
+            while os.path.exists(candidate) or candidate in self._claimed:
+                candidate = os.path.join(self.download_dir, f"{base}-{index}{ext}")
+                index += 1
+            self._claimed.add(candidate)
+            return candidate
+
+    def _release_path(self, path: str) -> None:
+        with self._claim_lock:
+            self._claimed.discard(path)
+
+    @staticmethod
+    def _cleanup_tmp(tmp_path: str) -> None:
+        """Delete only the temporary file; never touch the final path."""
         try:
-            with open(out_path, "wb") as out:
-                while received < size:
-                    (chunk_len,) = struct.unpack(">Q", recv_exact(conn, 8))
-                    if chunk_len == 0 or chunk_len > chunk_size + GCM_OVERHEAD or chunk_len > MAX_CHUNK:
-                        raise ProtocolError("invalid chunk length")
-                    ct = recv_exact(conn, chunk_len)
-                    nonce = crypto.chunk_nonce(nonce8, index)
-                    try:
-                        block = crypto.decrypt_with_nonce(key, nonce, ct, aad=header_bytes)
-                    except InvalidTag:
-                        raise AuthFailedError("chunk authentication failed")
-                    if len(block) > chunk_size:
-                        raise ProtocolError("chunk larger than declared")
-                    out.write(block)
-                    received += len(block)
-                    if received > size:
-                        raise ProtocolError("received more data than declared")
-                    index += 1
-                    self.on_progress(
-                        {
-                            "name": name,
-                            "size": size,
-                            "from": peer.get("name", fingerprint[:8]),
-                            "fingerprint": fingerprint,
-                        },
-                        received,
-                        size,
-                    )
-        except (ProtocolError, InvalidTag):
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
-            send_frame(conn, {"type": "error", "code": "auth_failed", "message": "transfer failed"})
-            raise
-        if received != size:
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
-            send_frame(conn, {"type": "error", "code": "short", "message": "transfer ended early"})
-            raise ProtocolError("transfer ended early")
-        send_frame(conn, {"type": "ok", "bytes": received})
-        self.on_transfer_complete(
-            {"name": name, "size": received, "path": out_path, "fingerprint": fingerprint}
-        )
+            os.remove(tmp_path)
+        except OSError:
+            pass

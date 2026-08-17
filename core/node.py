@@ -44,6 +44,8 @@ class Node:
         on_transfer_complete=None,
         log=None,
         kvm_platform=None,
+        max_transfer_size=None,
+        trusted_subnets=None,
     ):
         self.log = log or (lambda msg: None)
         self.on_status = on_status or (lambda s: None)
@@ -71,6 +73,8 @@ class Node:
             on_transfer_complete=self._t_done,
             on_error=lambda exc: self.log(f"transfer error: {exc}"),
             on_other=self._on_other,
+            max_transfer_size=max_transfer_size,
+            trusted_subnets=trusted_subnets,
         )
         self.sync = SyncEngine(self.store, self.discovery, on_status=on_status)
         if kvm_platform is None:

@@ -1,6 +1,7 @@
 """Shared pytest fixtures: paired Node pairs on loopback, temp dirs."""
 
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -13,6 +14,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.node import Node  # noqa: E402
 
 PORT_BASE = 49500
+
+
+def _sockets_available() -> bool:
+    """Loopback sockets work here? When they do not, the socket integration
+    group skips with a clear reason instead of failing broadly."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", 0))
+            s.listen(1)
+            return True
+        finally:
+            s.close()
+    except OSError:
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _skip_socket_group_when_unavailable(request):
+    if request.node.get_closest_marker("socket") and not _sockets_available():
+        pytest.skip("loopback sockets are unavailable in this environment")
 
 
 class NodePair:

@@ -34,6 +34,14 @@ def _png_to_dib(png_bytes: bytes) -> bytes:
     return bmp.getvalue()[14:]  # strip BITMAPFILEHEADER, keep BITMAPINFO + pixels
 
 
+def change_count() -> int:
+    """Clipboard sequence number: a monotonic revision counter, cheap to
+    query and requiring no clipboard ownership."""
+    import ctypes
+
+    return int(ctypes.windll.user32.GetClipboardSequenceNumber())
+
+
 def read() -> ClipboardSnapshot:
     try:
         import win32clipboard

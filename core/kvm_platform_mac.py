@@ -9,11 +9,11 @@ callback does with each event:
                 it for seam detection and chord arming
     controlling forward it to the engine (swallowed at the tap) and hide
                 the cursor
-    remote      drop mouse/buttons/wheel, but still forward *keys* to
-                the engine so the emergency escape chord is detected
-                before any input is swallowed
+    remote      physical mouse movement, clicks, and wheel input release
+                control locally; keys still reach the engine so the
+                emergency escape chord is detected before input is swallowed
 
-Injected events carry a kCGEventSourceUserDataField sentinel and the
+Injected events carry a kCGEventSourceUserData sentinel and the
 native pid; the tap drops anything marked like that, so input never
 echoes. The return seam is detected at injection time (the peer drives
 our cursor with absolute moves), not by a poller.
@@ -26,7 +26,7 @@ import os
 import threading
 import time
 
-from .kvm_geometry import Monitor, ScreenLayout, ScreenLayoutCache, in_jump_zone
+from .kvm_geometry import Monitor, ScreenLayout, in_jump_zone
 
 SENTINEL = 0x5E4C0DE5
 
@@ -79,8 +79,6 @@ class MacInputPlatform:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._callback_ref = None
-        self._reconfig_cb = None
-        self._layout_cache = ScreenLayoutCache(self._layout_uncached)
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -92,12 +90,17 @@ class MacInputPlatform:
         self.engine = engine
         self._stop.clear()
         self._callback_ref = self._make_callback()
-        self._register_display_callbacks()
         self._tap_thread = threading.Thread(target=self._tap_main, name="kvm-tap", daemon=True)
         self._tap_thread.start()
 
     def stop(self) -> None:
-        self._unregister_display_callbacks()
+        # Never leave the user's pointing device decoupled if sharing stops
+        # while this Mac is being controlled remotely.
+        if _QUARTZ_OK:
+            try:
+                Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+            except Exception:
+                pass
         self._stop.set()
         with self._lock:
             rl = self._tap_runloop
@@ -206,10 +209,7 @@ class MacInputPlatform:
             self._forward(event, etype)
             return None
         if self._mode == "remote":
-            # Remote mode swallows local input, but keys must still reach
-            # the engine so the emergency escape chord is detected before
-            # anything is suppressed.
-            self._forward_keys(event, etype)
+            self._forward_remote_input(event, etype)
             return None
         return None
 
@@ -222,8 +222,8 @@ class MacInputPlatform:
         engine = self.engine
         if engine is None:
             return
-        user = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUserDataField)
-        pid = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUnixProcessIDField)
+        user = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUserData)
+        pid = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUnixProcessID)
         if user == SENTINEL or (pid and pid == os.getpid()):
             return
         try:
@@ -240,13 +240,46 @@ class MacInputPlatform:
         except Exception:
             pass
 
+    def _forward_remote_input(self, event, etype) -> None:
+        """Release remote control on real local pointer input.
+
+        The injected CGEvents carry our sentinel, so they never take this
+        path.  That avoids treating an injected cursor landing at an edge as
+        a request to immediately hand control back.
+        """
+        q = _q()
+        engine = self.engine
+        if engine is None:
+            return
+        user = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUserData)
+        pid = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUnixProcessID)
+        if user == SENTINEL or (pid and pid == os.getpid()):
+            return
+        pointer_events = (
+            q.kCGEventMouseMoved,
+            q.kCGEventLeftMouseDragged,
+            q.kCGEventRightMouseDragged,
+            q.kCGEventOtherMouseDragged,
+            q.kCGEventLeftMouseDown,
+            q.kCGEventLeftMouseUp,
+            q.kCGEventRightMouseDown,
+            q.kCGEventRightMouseUp,
+            q.kCGEventOtherMouseDown,
+            q.kCGEventOtherMouseUp,
+            q.kCGEventScrollWheel,
+        )
+        if etype in pointer_events:
+            engine.on_remote_local_input()
+            return
+        self._forward_keys(event, etype)
+
     def _forward(self, event, etype) -> None:
         q = _q()
         engine = self.engine
         if engine is None:
             return
-        user = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUserDataField)
-        pid = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUnixProcessIDField)
+        user = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUserData)
+        pid = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUnixProcessID)
         if user == SENTINEL or (pid and pid == os.getpid()):
             return
         try:
@@ -310,18 +343,23 @@ class MacInputPlatform:
     def set_delegation(self, state: str) -> None:
         with self._lock:
             self._mode = state
-        if state == "local":
+        q = _q()
+        if state in ("remote", "controlling"):
+            # Decouples hardware mouse deltas from the on-screen cursor.
+            # Needed in both directions: "remote" so injected absolute moves
+            # aren't fought by the local trackpad's own accumulator, and
+            # "controlling" so the cursor actually stops moving locally -
+            # swallowing the CGEvent in the tap callback only stops apps
+            # from seeing it, it does not stop WindowServer from moving the
+            # cursor sprite off raw HID deltas.
+            q.CGAssociateMouseAndMouseCursorPosition(False)
+        elif state == "local":
+            q.CGAssociateMouseAndMouseCursorPosition(True)
             self.show_cursor()
 
     # -- geometry ---------------------------------------------------------------
 
     def screen_layout(self) -> ScreenLayout:
-        return self._layout_cache.get()
-
-    def invalidate_layout(self) -> None:
-        self._layout_cache.invalidate()
-
-    def _layout_uncached(self) -> ScreenLayout:
         if NSScreen is None:
             raise MacPlatformError("AppKit unavailable")
         monitors = []
@@ -338,37 +376,6 @@ class MacInputPlatform:
             )
         return ScreenLayout(monitors, primary=0)
 
-    # -- display-change notifications -------------------------------------------
-
-    def _register_display_callbacks(self) -> None:
-        if not _QUARTZ_OK:
-            return
-        try:
-
-            def reconfig(display, flags, userinfo):
-                self._layout_cache.invalidate()
-                if self.engine is not None:
-                    try:
-                        self.engine.on_display_change()
-                    except Exception:
-                        pass
-
-            # Keep a reference so pyobjc does not collect the callback.
-            self._reconfig_cb = reconfig
-            Quartz.CGDisplayRegisterReconfigurationCallback(reconfig, None)
-        except Exception:
-            self._reconfig_cb = None
-
-    def _unregister_display_callbacks(self) -> None:
-        cb = self._reconfig_cb
-        self._reconfig_cb = None
-        if cb is None:
-            return
-        try:
-            Quartz.CGDisplayUnregisterReconfigurationCallback(cb, None)
-        except Exception:
-            pass
-
     def cursor_position(self) -> tuple[int, int]:
         q = _q()
         ev = q.CGEventCreate(None)
@@ -380,10 +387,12 @@ class MacInputPlatform:
         q.CGWarpMouseCursorPosition((x, y))
 
     def hide_cursor(self) -> None:
-        _q().CGDisplayHideCursor(_q().kCGDirectMainDisplay)
+        q = _q()
+        q.CGDisplayHideCursor(q.CGMainDisplayID())
 
     def show_cursor(self) -> None:
-        _q().CGDisplayShowCursor(_q().kCGDirectMainDisplay)
+        q = _q()
+        q.CGDisplayShowCursor(q.CGMainDisplayID())
 
     # -- injection ---------------------------------------------------------------
 
@@ -392,10 +401,10 @@ class MacInputPlatform:
         x, y = self.cursor_position()
         nx, ny = x + dx, y + dy
         self.warp_cursor(nx, ny)
-        ev = q.CGEventCreateMouseEvent(None, q.kCGEventMouseMoved, (nx, ny), q.kCGMouseEventButtonLeft)
+        ev = q.CGEventCreateMouseEvent(None, q.kCGEventMouseMoved, (nx, ny), q.kCGMouseButtonLeft)
         q.CGEventSetIntegerValueField(ev, q.kCGMouseEventDeltaX, dx)
         q.CGEventSetIntegerValueField(ev, q.kCGMouseEventDeltaY, dy)
-        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserDataField, SENTINEL)
+        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserData, SENTINEL)
         # Session-tap posting is below our HID capture tap, so the injected
         # event reaches the target app without being mistaken for local input.
         q.CGEventPost(q.kCGSessionEventTap, ev)
@@ -404,8 +413,8 @@ class MacInputPlatform:
     def inject_move_abs(self, x: int, y: int) -> None:
         q = _q()
         self.warp_cursor(x, y)
-        ev = q.CGEventCreateMouseEvent(None, q.kCGEventMouseMoved, (x, y), q.kCGMouseEventButtonLeft)
-        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserDataField, SENTINEL)
+        ev = q.CGEventCreateMouseEvent(None, q.kCGEventMouseMoved, (x, y), q.kCGMouseButtonLeft)
+        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserData, SENTINEL)
         q.CGEventPost(q.kCGSessionEventTap, ev)
         self._report_edge(x, y)
 
@@ -435,13 +444,13 @@ class MacInputPlatform:
             field = button
         pos = self.cursor_position()
         ev = q.CGEventCreateMouseEvent(None, etype, pos, field)
-        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserDataField, SENTINEL)
+        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserData, SENTINEL)
         q.CGEventPost(q.kCGSessionEventTap, ev)
 
     def inject_wheel(self, dy: int, dx: int) -> None:
         q = _q()
         ev = q.CGEventCreateScrollWheelEvent(None, q.kCGScrollEventUnitLine, 2, dy / 120.0, dx / 120.0)
-        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserDataField, SENTINEL)
+        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserData, SENTINEL)
         q.CGEventPost(q.kCGSessionEventTap, ev)
 
     def inject_key(self, hid: int, down: bool) -> None:
@@ -452,7 +461,7 @@ class MacInputPlatform:
         if vk is None:
             return
         ev = q.CGEventCreateKeyboardEvent(None, vk, down)
-        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserDataField, SENTINEL)
+        q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserData, SENTINEL)
         q.CGEventPost(q.kCGSessionEventTap, ev)
 
 
