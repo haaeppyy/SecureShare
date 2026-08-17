@@ -636,7 +636,7 @@ _VK_FLAG_BITS = {
 def main():
     """Standalone verification of capture/inject/filter/cursor on this Mac.
 
-        python core/kvm_platform_mac.py --spike
+        python -m core.kvm_platform_mac --spike
 
     Prints permission state and the local layout, then for N seconds
     prints captured mouse deltas, buttons, wheel and keys. Two seconds in
