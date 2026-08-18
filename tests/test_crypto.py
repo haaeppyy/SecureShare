@@ -72,3 +72,5 @@ def test_explicit_nonce_encrypt():
     assert crypto.decrypt_with_nonce(key, nonce, ct, aad=b"h") == b"data"
     with pytest.raises(InvalidTag):
         crypto.decrypt_with_nonce(key, nonce, ct, aad=b"x")
+
+pytestmark = pytest.mark.unit

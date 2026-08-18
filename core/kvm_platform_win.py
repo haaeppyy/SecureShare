@@ -18,9 +18,11 @@ time, not by a poller.
 
 import ctypes
 import ctypes.wintypes as wt
+from collections import deque
 import threading
+import time
 
-from .kvm_geometry import Monitor, ScreenLayout, ScreenLayoutCache, in_jump_zone
+from .kvm_geometry import Monitor, ScreenLayout, in_jump_zone
 
 SENTINEL = 0x5E4C0DE5
 
@@ -154,9 +156,11 @@ class WindowsInputPlatform:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._last_pos = None
+        # Recent untaggable SetCursorPos moves. A single slot races when the
+        # hook queue receives a burst of remote cursor updates.
+        self._ignore_warps = deque()
         self._pressed = set()
         self._virtual = None  # virtual-desktop pixel bounds (l, t, r, b)
-        self._layout_cache = ScreenLayoutCache(self._layout_uncached)
         if _WIN_OK:
             try:
                 ctypes.windll.user32.SetProcessDPIAware()
@@ -170,6 +174,7 @@ class WindowsInputPlatform:
         if not _WIN_OK:
             raise WindowsPlatformError("pywin32 unavailable")
         self.engine = engine
+        engine._capture_origin = "win"
         self._stop.clear()
         self._hook_thread = threading.Thread(target=self._hook_main, name="kvm-hooks", daemon=True)
         self._hook_thread.start()
@@ -192,21 +197,19 @@ class WindowsInputPlatform:
             self._hook_thread.join(timeout=2)
 
     def permission_ok(self) -> bool:
-        if not _WIN_OK:
-            return False
-        try:
-            return bool(_user32.IsUserAnAdmin())
-        except Exception:
-            return True
+        """Return whether the Windows input backend is available.
+
+        Low-level hooks and ``SendInput`` work for a normal desktop process;
+        requiring an elevated token here disabled KVM for almost every
+        Windows user before a channel could be opened.  Windows can prevent
+        a non-elevated process from controlling an *elevated* target app, but
+        that is an OS security boundary, not a prerequisite for sharing.
+        """
+        return _WIN_OK
 
     def permission_detail(self) -> str:
         if not _WIN_OK:
             return "pywin32 unavailable"
-        try:
-            if not bool(_user32.IsUserAnAdmin()):
-                return "missing Windows permission: run SecureShare as Administrator"
-        except Exception:
-            pass
         return "all permissions granted"
 
     # -- hooks ------------------------------------------------------------------
@@ -245,6 +248,13 @@ class WindowsInputPlatform:
         if engine is None:
             return _user32.CallNextHookEx(None, 0, wParam, info)
         x, y = int(info.pt.x), int(info.pt.y)
+        if wParam == WM_MOUSEMOVE and self._consume_warp_move(x, y):
+            return _user32.CallNextHookEx(None, 0, wParam, info)
+        if self._mode == "remote":
+            # Physical input on the controlled computer intentionally ends
+            # sharing. SendInput events were returned above by their sentinel.
+            engine.on_remote_local_input(origin="win-mouse")
+            return 1
         try:
             if wParam == WM_MOUSEMOVE:
                 if self._last_pos is not None:
@@ -307,9 +317,19 @@ class WindowsInputPlatform:
 
     # -- delegation --------------------------------------------------------------
 
-    def set_delegation(self, state: str) -> None:
+    def set_delegation(self, state: str) -> bool:
         with self._lock:
             self._mode = state
+        return True
+
+    def diagnostics(self) -> dict:
+        with self._lock:
+            return {
+                "family": "win",
+                "mode": self._mode,
+                "hook_thread_alive": bool(self._hook_thread and self._hook_thread.is_alive()),
+                "ignore_warps": len(self._ignore_warps),
+            }
 
     # -- geometry -----------------------------------------------------------------
 
@@ -325,12 +345,6 @@ class WindowsInputPlatform:
             self._virtual = (0, 0, 1920, 1080)
 
     def screen_layout(self) -> ScreenLayout:
-        return self._layout_cache.get()
-
-    def invalidate_layout(self) -> None:
-        self._layout_cache.invalidate()
-
-    def _layout_uncached(self) -> ScreenLayout:
         if not _WIN_OK:
             raise WindowsPlatformError("pywin32 unavailable")
         self._refresh_virtual_bounds()
@@ -358,6 +372,9 @@ class WindowsInputPlatform:
         return int(pt.x), int(pt.y)
 
     def warp_cursor(self, x: int, y: int) -> None:
+        self._ignore_warps.append((int(x), int(y), time.monotonic() + 0.25))
+        while len(self._ignore_warps) > 64:
+            self._ignore_warps.popleft()
         if not _user32.SetCursorPos(int(x), int(y)):
             self._warp_fallback(x, y)
             return
@@ -365,6 +382,20 @@ class WindowsInputPlatform:
         got = self.cursor_position()
         if abs(got[0] - x) > 4 or abs(got[1] - y) > 4:
             self._warp_fallback(x, y)
+
+    def _consume_warp_move(self, x: int, y: int) -> bool:
+        now = time.monotonic()
+        matched = False
+        remaining = deque()
+        for expected_x, expected_y, expiry in self._ignore_warps:
+            if expiry <= now:
+                continue
+            if not matched and abs(x - expected_x) <= 1 and abs(y - expected_y) <= 1:
+                matched = True
+                continue
+            remaining.append((expected_x, expected_y, expiry))
+        self._ignore_warps = remaining
+        return matched
 
     def _warp_fallback(self, x: int, y: int) -> None:
         if self._virtual is None:
@@ -398,8 +429,22 @@ class WindowsInputPlatform:
     # -- injection -----------------------------------------------------------------
 
     def inject_move_rel(self, dx: int, dy: int) -> None:
-        x, y = self.cursor_position()
-        self.inject_move_abs(x + dx, y + dy)
+        if not dx and not dy:
+            return
+        _send_input(
+            [
+                INPUT(
+                    type=INPUT_MOUSE,
+                    mi=MOUSEINPUT(
+                        dx=dx,
+                        dy=dy,
+                        mouseData=0,
+                        dwFlags=MOUSEEVENTF_MOVE,
+                        dwExtraInfo=SENTINEL,
+                    ),
+                )
+            ]
+        )
 
     def inject_move_abs(self, x: int, y: int) -> None:
         self.warp_cursor(x, y)

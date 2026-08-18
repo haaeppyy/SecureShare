@@ -8,12 +8,15 @@ reflect current state (peers, sync toggle).
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pystray  # noqa: E402
 
 from tray.app import TrayApp  # noqa: E402
+
+import pytest
 
 
 class Peer:
@@ -74,6 +77,9 @@ class StubKVM:
 
     def control_state(self, fp):
         return self._controls.get(fp, "local")
+
+    def control_label(self, fp):
+        return self.control_state(fp)
 
 
 class StubDiscovery:
@@ -415,7 +421,7 @@ def test_kvm_peer_menu_shows_consent_and_side():
     app = make_app({})
     app.node.store = store
     menu = app._build_menu()
-    consent = find_text(menu, "Allow this device to control this Mac")
+    consent = find_text(menu, "Allow this device to control Tester")
     assert consent and all(it._checked(it) for it in consent)
     tops = find_text(menu, "Top")
     assert tops, "side radio items must exist"
@@ -437,11 +443,11 @@ def test_kvm_side_action_updates_store():
 def test_kvm_consent_action_updates_store():
     app = make_app({})
     menu = app._build_menu()
-    allow = find_text(menu, "Allow this device to control this Mac")[0]
+    allow = find_text(menu, "Allow this device to control Tester")[0]
     allow._action(None, allow)
     assert app.node.store.peers["fp-paired"]["kvm_allowed"] is True
     menu = app._build_menu()
-    deny = find_text(menu, "Allow this device to control this Mac")[0]
+    deny = find_text(menu, "Allow this device to control Tester")[0]
     deny._action(None, deny)
     assert app.node.store.peers["fp-paired"]["kvm_allowed"] is False
 
@@ -479,13 +485,78 @@ def test_kvm_status_offline_without_links():
     assert find_text(menu, "KVM status: offline")
 
 
-def test_toast_dedup_suppresses_same_message_within_window():
+def test_kvm_side_labels_use_device_name():
+    app = make_app({})
+    menu = app._build_menu()
+    assert find_text(menu, "Allow this device to control Tester")
+    assert find_text(menu, "This device is on this side of Tester")
+
+
+def test_share_files_aggregate_into_one_batch():
+    app = make_app({})
+    app._queue_share_files(["a", "b"])
+    app._queue_share_files(["b", "c"])  # duplicates collapse
+    assert app._share_pending == ["a", "b", "c"]
+    app._share_flush_at = time.monotonic() - 1
+    app._flush_share_picker()
+    assert app._share_pending == []
+    assert app._share_dialog_files == ["a", "b", "c"]
+
+
+def test_share_batch_sends_all_files_to_chosen_peer():
+    app = make_app({})
+    sent = []
+    app._send_to = lambda peer, path: sent.append((peer["name"], path))
+    app._share_dialog_files = ["a", "b", "c"]
+    app._send_share_batch({"fingerprint": "fp-paired", "name": "PairedBox"})
+    assert sent == [("PairedBox", "a"), ("PairedBox", "b"), ("PairedBox", "c")]
+    assert app._share_dialog_files == []
+
+
+def test_pump_interval_is_adaptive():
+    app = make_app({})
+    assert app._pump_interval() == app.IDLE_PUMP_INTERVAL
+    app._transfers = {"recv:a:b": {}}
+    assert app._pump_interval() == app.BUSY_PUMP_INTERVAL
+    app._transfers = {}
+    app._pending_toasts = ["boom"]
+    assert app._pump_interval() == app.BUSY_PUMP_INTERVAL
+    app._pending_toasts = []
+    app._toast_flush_at = time.monotonic() + 1
+    assert app._pump_interval() == app.BUSY_PUMP_INTERVAL
+    app._toast_flush_at = 0.0
+    app._share_pending = ["/tmp/x"]
+    assert app._pump_interval() == app.BUSY_PUMP_INTERVAL
+    app._share_pending = []
+    app._pair_dialogs = {"fp": object()}
+    assert app._pump_interval() == app.BUSY_PUMP_INTERVAL
+    app._pair_dialogs = {}
+    assert app._pump_interval() == app.IDLE_PUMP_INTERVAL
+
+
+def test_toast_drops_info_and_aggregates_errors():
     app = make_app({})
     notified = []
     app.icon = type("Icon", (), {"notify": lambda self, m, t: notified.append(m)})()
-    app._toast("same")
-    app._toast("same")
+    app._toast("Clipboard sync: on")
+    app._toast("KVM linked with peer")
+    app._toast("peer controls this device")
+    assert notified == []  # info/status messages never reach the user
+
+    app._toast("send failed: boom", "error")
+    app._toast("kvm error: kaboom", "error")
+    assert notified == []  # aggregated until the window elapses
+
+    app._toast_flush_at = time.monotonic() - 1
+    app._flush_toasts()
+    assert notified == ["send failed: boom; kvm error: kaboom"]
+
+    # The same combination is not re-shown.
+    app._toast("send failed: boom", "error")
+    app._toast("kvm error: kaboom", "error")
+    app._toast_flush_at = 0.0
+    app._flush_toasts()
     assert len(notified) == 1
-    app._last_toast_slot = -1  # pretend the 3s window elapsed
-    app._toast("same")
-    assert len(notified) == 2
+
+
+pytestmark = pytest.mark.unit

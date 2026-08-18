@@ -81,6 +81,13 @@ def _read_text(appkit):
         return None
 
 
+def change_count() -> int:
+    """NSPasteboard change counter: a monotonic revision number whose
+    comparison needs no content copy at all."""
+    pb = _appkit()["NSPasteboard"].generalPasteboard()
+    return int(pb.changeCount())
+
+
 def read() -> ClipboardSnapshot:
     try:
         appkit = _appkit()

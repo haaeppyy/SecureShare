@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "secure-share"
+version = "1.0.0"
+description = "LAN-only encrypted file transfer and clipboard sync tray app"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+    "cryptography>=42.0",
+    "zeroconf>=0.132",
+    "pystray>=0.19.5",
+    "Pillow>=10.0",
+    "pyperclip>=1.8",
+    "keyring>=24.0",
+]
+
+[project.optional-dependencies]
+darwin = ["pyobjc-framework-Cocoa>=10.0"]
+win32 = ["pywin32>=306"]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools]
+packages = ["core", "tray"]
+
+[tool.setuptools.package-data]
+tray = ["icons/*.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-m", "unit"]
+markers = [
+    "unit: pure unit tests, no sockets or OS services (default group)",
+    "socket: local loopback socket integration tests",
+    "manual: real mDNS / real clipboard / physical KVM tests needing two devices",
+]

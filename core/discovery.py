@@ -17,6 +17,7 @@ from zeroconf import ServiceBrowser, ServiceInfo, ServiceStateChange, Zeroconf
 
 SERVICE_TYPE = "_secureshare._tcp.local."
 RESOLVE_INTERVAL = 1.0
+RESOLVE_MAX_WAIT = 2.0
 
 
 def _pick_address(info: ServiceInfo) -> str | None:
@@ -88,14 +89,10 @@ class Discovery:
         self._peers: dict[str, Peer] = {}
         self._pending: dict[str, int] = {}  # service name -> failed attempts
         self._stop = threading.Event()
-        self._resolve_thread: threading.Thread | None = None
+        self._resolve_wake = threading.Event()
+        self._resolver: threading.Thread | None = None
 
     def start(self) -> None:
-        if self._resolve_thread is not None and self._resolve_thread.is_alive():
-            raise RuntimeError(
-                "Discovery.start() called while the resolve thread is still "
-                "running; call stop() first"
-            )
         self._stop.clear()
         service_name = f"{sanitize(self.name)}-{self.fingerprint[:8]}.{SERVICE_TYPE}"
         self._info = ServiceInfo(
@@ -122,6 +119,7 @@ class Discovery:
 
     def stop(self) -> None:
         self._stop.set()
+        self._resolve_wake.set()  # unblock the resolver thread immediately
         try:
             if self._browser is not None:
                 self._browser.cancel()
@@ -133,14 +131,6 @@ class Discovery:
             pass
         self._zc = None
         self._browser = None
-        if self._resolve_thread is not None:
-            self._resolve_thread.join(timeout=2.0)
-            if self._resolve_thread.is_alive():
-                print(
-                    "[discovery] resolve thread did not exit within timeout",
-                    flush=True,
-                )
-            self._resolve_thread = None
 
     # -- zeroconf events (must stay light: never call get_service_info here) --
 
@@ -153,9 +143,14 @@ class Discovery:
             self._drop_service(name)
         elif state_change in (ServiceStateChange.Added, ServiceStateChange.Updated):
             with self._lock:
-                # re-resolve if we don't have a peer for this service yet
-                if not any(p.service == name for p in self._peers.values()):
-                    self._pending.setdefault(name, 0)
+                # An Updated event can carry a new address or port after
+                # sleep/wake, DHCP renewal, or a Wi-Fi/VPN change.  Queue it
+                # even when the service is already known so KVM and clipboard
+                # reconnect using the current endpoint rather than a stale
+                # Peer record.
+                self._pending.setdefault(name, 0)
+            # resolve promptly instead of waiting out the poll interval
+            self._resolve_wake.set()
             import os as _os
             if _os.environ.get("SECURESHARE_DEBUG"):
                 print(f"[discovery] {state_change.name} {name}", flush=True)
@@ -176,7 +171,10 @@ class Discovery:
 
     def _resolve_loop(self) -> None:
         while not self._stop.is_set():
-            self._stop.wait(RESOLVE_INTERVAL)
+            # Wake as soon as a service was (re)queued; otherwise poll
+            # rarely so an idle resolver thread costs almost nothing.
+            self._resolve_wake.wait(RESOLVE_MAX_WAIT)
+            self._resolve_wake.clear()
             to_resolve: list[str] = []
             with self._lock:
                 to_resolve = list(self._pending.keys())

@@ -12,23 +12,65 @@ Layout of a busy node:
 """
 
 import argparse
+import json
 import os
 import queue
+import socket
 import sys
 import threading
 import time
+import urllib.parse
 from functools import partial
 
 import pystray
 from PIL import Image, ImageDraw
 
+from core.version import version_label
+
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.node import Node
-from core.transfer import default_download_dir
+try:
+    from core.node import Node
+    from core.transfer import default_download_dir
+except RuntimeError as exc:
+    print(f"SecureShare cannot start: {exc}", file=sys.stderr)
+    sys.exit(1)
 
 ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "tray.png")
+
+SHARE_IPC_PORT = 48625
+SHARE_IPC_MAX = 65536
+SHARE_AGGREGATE_WINDOW = 1.5
+
+
+def share_files_from_url(url: str) -> list[str]:
+    """Parse secureshare://send?files=<newline-joined, percent-encoded paths>."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "secureshare" or parsed.netloc != "send":
+        return []
+    query = urllib.parse.parse_qs(parsed.query)
+    raw = query.get("files", [""])[0]
+    return [p for p in urllib.parse.unquote(raw).split("\n") if p]
+
+
+def forward_share_request(files: list[str]) -> bool:
+    """Hand the file list to the running primary instance; False when none
+    is listening (the caller should start one and own the request)."""
+    if not files:
+        return True
+    try:
+        with socket.create_connection(("127.0.0.1", SHARE_IPC_PORT), timeout=1.5) as conn:
+            conn.sendall(
+                json.dumps({"action": "share", "files": files}).encode("utf-8")[
+                    : SHARE_IPC_MAX
+                ]
+            )
+            conn.settimeout(2.0)
+            reply = conn.recv(16)
+            return reply.strip() == b"ok"
+    except OSError:
+        return False
 
 
 def default_icon():
@@ -48,11 +90,14 @@ def load_icon():
 
 
 class TrayApp:
-    def __init__(self, name=None, data_dir=None, download_dir=None, port=None):
+    def __init__(self, name=None, data_dir=None, download_dir=None, port=None, max_transfer_size=None, trusted_subnets=None, initial_share_files=None):
         self.name = name or None
         self.data_dir = data_dir
         self.download_dir = download_dir or default_download_dir()
         self.port = port
+        self.max_transfer_size = max_transfer_size
+        self.trusted_subnets = trusted_subnets
+        self._initial_share_files = list(initial_share_files or [])
         self.node = None
         self.icon = None
         self.root = None
@@ -63,24 +108,33 @@ class TrayApp:
         self._last_menu_refresh = 0.0
         self._menu_sig = None
         self._last_toast_text = None
-        self._last_toast_slot = -1
+        self._pending_toasts = []
+        self._toast_flush_at = 0.0
         self._stopping = False
         self._transfers = {}
         self._last_tx_post = {}
         self._transfer_window = None
         self._transfer_rows = {}
+        self._share_ipc = None
+        self._share_pending = []
+        self._share_flush_at = 0.0
+        self._share_dialog = None
+        self._share_dialog_files = []
 
     # -- lifecycle -----------------------------------------------------------
 
     def run(self):
         from core.transfer import DEFAULT_PORT
 
+        self._start_share_ipc()
         self.node = Node(
             name=self.name,
             data_dir=self.data_dir,
             download_dir=self.download_dir,
             port=self.port or DEFAULT_PORT,
-            on_status=lambda s: self.post(self._toast, s),
+            max_transfer_size=self.max_transfer_size,
+            trusted_subnets=self.trusted_subnets,
+            on_status=lambda s, level="info": self.post(self._status_event, s, level),
             on_incoming_pair=lambda s: self.post(self._handle_session, s),
             on_transfer_start=lambda i: self.post(
                 self._tx_start, "recv", i["fingerprint"], i["from"], i["name"], i["size"]
@@ -98,6 +152,10 @@ class TrayApp:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
+
+        from tray.logbook import LogBook
+
+        self._logbook = LogBook(self.root, dump_diag=self._kvm_diagnostics)
 
         icon_options = {}
         if sys.platform == "darwin":
@@ -119,7 +177,9 @@ class TrayApp:
             **icon_options,
         )
         self.icon.run_detached()
-        self.post(self._toast, f"SecureShare running as {self.node.store.identity['name']}")
+        if self._initial_share_files:
+            self._queue_share_files(self._initial_share_files)
+            self._initial_share_files = []
         self._pump()
 
     def _quit(self):
@@ -142,12 +202,178 @@ class TrayApp:
         except Exception:
             pass
         self._close_transfer_window()
+        ipc = self._share_ipc
+        self._share_ipc = None
+        if ipc is not None:
+            try:
+                ipc.close()
+            except Exception:
+                pass
         try:
             self.root.destroy()
         except Exception:
             pass
 
+    # -- share IPC (loopback, single primary) --------------------------------
+
+    def _start_share_ipc(self):
+        """Bind the loopback share listener; if another instance already
+        holds it, this instance stays a client (requests get forwarded)."""
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", SHARE_IPC_PORT))
+            srv.listen(4)
+            srv.settimeout(0.5)
+            self._share_ipc = srv
+            threading.Thread(target=self._share_ipc_loop, name="share-ipc", daemon=True).start()
+        except OSError:
+            self._share_ipc = None
+
+    def _share_ipc_loop(self):
+        while not self._stopping:
+            try:
+                conn, addr = self._share_ipc.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(
+                target=self._handle_share_ipc, args=(conn, addr), daemon=True
+            ).start()
+
+    def _handle_share_ipc(self, conn, addr):
+        try:
+            if addr[0] != "127.0.0.1":
+                return
+            conn.settimeout(2.0)
+            data = conn.recv(SHARE_IPC_MAX + 1)
+            if not data or len(data) > SHARE_IPC_MAX:
+                return
+            req = json.loads(data.decode("utf-8"))
+            if req.get("action") != "share":
+                return
+            files = [
+                f
+                for f in req.get("files", [])
+                if isinstance(f, str) and os.path.isfile(f)
+            ]
+            if files:
+                self.post(self._queue_share_files, files)
+            conn.sendall(b"ok")
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _queue_share_files(self, files: list[str]):
+        added = False
+        for f in files:
+            if f not in self._share_pending:
+                self._share_pending.append(f)
+                added = True
+        if added:
+            self._share_flush_at = time.monotonic() + SHARE_AGGREGATE_WINDOW
+
+    def _flush_share_picker(self):
+        if not self._share_pending or not self._share_flush_at:
+            return
+        if time.monotonic() < self._share_flush_at:
+            return
+        self._share_flush_at = 0.0
+        self._show_share_dialog()
+
+    def _close_share_dialog(self):
+        win = self._share_dialog
+        self._share_dialog = None
+        self._share_dialog_files = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _show_share_dialog(self):
+        """One picker for all pending files: pick a paired device, every file
+        goes to it."""
+        files = self._share_pending
+        self._share_pending = []
+        if not files:
+            return
+        if self._share_dialog is not None:
+            try:
+                if self._share_dialog.winfo_exists():
+                    self._share_dialog_files.extend(files)
+                    return
+            except Exception:
+                pass
+        if self.root is None:
+            # Headless (tests): record the batch; nothing to show.
+            self._share_dialog_files = list(files)
+            return
+        import tkinter as tk
+
+        self._prepare_dialog()
+        win = tk.Toplevel(self.root)
+        win.title("SecureShare - Send files")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.protocol("WM_DELETE_WINDOW", self._close_share_dialog)
+        self._share_dialog = win
+        self._share_dialog_files = list(files)
+        tk.Label(
+            win,
+            text=f"Send {len(files)} file(s) to:",
+            font=("", 12, "bold"),
+        ).pack(padx=28, pady=(16, 6))
+        peers = sorted(
+            self.node.store.list_peers(), key=lambda p: (p["name"] or "").lower()
+        )
+        if not peers:
+            tk.Label(win, text="No paired devices yet", fg="#888").pack(pady=4)
+        else:
+            for peer in peers:
+                tk.Button(
+                    win,
+                    text=peer["name"] or peer["fingerprint"][:8],
+                    width=26,
+                    command=lambda p=peer: self._send_share_batch(p),
+                ).pack(pady=2)
+        tk.Button(win, text="Cancel", width=12, command=self._close_share_dialog).pack(
+            pady=(10, 14)
+        )
+
+    def _send_share_batch(self, peer):
+        files = list(self._share_dialog_files)
+        self._close_share_dialog()
+        for path in files:
+            self._send_to(peer, path)
+
     # -- main-thread queue pump ----------------------------------------------
+
+    BUSY_PUMP_INTERVAL = 0.1
+    IDLE_PUMP_INTERVAL = 1.0
+
+    def _pump_interval(self) -> float:
+        """Wake often while something needs the main thread (transfers,
+        queued toasts, share picker, dialogs); otherwise once per second so
+        an idle tray app costs almost no CPU."""
+        if (
+            self._transfers
+            or self._pending_toasts
+            or self._toast_flush_at
+            or self._share_pending
+            or self._share_flush_at
+            or self._pair_dialogs
+            or self._transfer_window is not None
+            or self._share_dialog is not None
+            or (getattr(self, "_logbook", None) is not None and self._logbook.open)
+        ):
+            return self.BUSY_PUMP_INTERVAL
+        return self.IDLE_PUMP_INTERVAL
 
     def post(self, fn, *args):
         self._queue.put((fn, args))
@@ -155,17 +381,21 @@ class TrayApp:
     def _pump(self):
         while not self._stopping:
             try:
-                fn, args = self._queue.get(timeout=0.1)
+                fn, args = self._queue.get(timeout=self._pump_interval())
             except queue.Empty:
                 self._refresh_menu_if_stale()
                 if self.root:
                     self.root.update_idletasks()
                     self.root.update()
+                self._flush_toasts()
+                self._flush_share_picker()
                 continue
             try:
                 fn(*args)
             except Exception as exc:
-                self._toast(f"error: {exc}")
+                self._toast(f"error: {exc}", level="error")
+            self._flush_toasts()
+            self._flush_share_picker()
             if self.root:
                 try:
                     self.root.update_idletasks()
@@ -175,19 +405,59 @@ class TrayApp:
 
     # -- UI helpers (main thread only) ---------------------------------------
 
-    def _toast(self, message: str):
-        now = time.monotonic()
-        if (message, now // 3) == (self._last_toast_text, self._last_toast_slot):
+    TOAST_WINDOW = 1.0
+    TOAST_MAX_ITEMS = 4
+
+    def _toast(self, message: str, level: str = "info"):
+        """Notifications policy: only error-level messages reach the user;
+        everything else (link state, takeover, toggles) is dropped. Errors
+        arriving within the same short window are combined into ONE
+        notification, flushed by the pump."""
+        if level != "error":
             return
-        self._last_toast_text = message
-        self._last_toast_slot = now // 3
+        if message not in self._pending_toasts:
+            self._pending_toasts.append(message)
+        if not self._toast_flush_at:
+            self._toast_flush_at = time.monotonic() + self.TOAST_WINDOW
+
+    def _flush_toasts(self):
+        if not self._pending_toasts or not self._toast_flush_at:
+            return
+        if time.monotonic() < self._toast_flush_at:
+            return
+        messages = self._pending_toasts[: self.TOAST_MAX_ITEMS]
+        if len(self._pending_toasts) > self.TOAST_MAX_ITEMS:
+            messages.append(
+                f"... and {len(self._pending_toasts) - self.TOAST_MAX_ITEMS} more"
+            )
+        self._pending_toasts.clear()
+        self._toast_flush_at = 0.0
+        text = "; ".join(messages)
+        if text == self._last_toast_text:
+            return
+        self._last_toast_text = text
         try:
-            self.icon.notify(str(message), "SecureShare")
+            self.icon.notify(text, "SecureShare")
         except Exception:
             pass
 
     def _log(self, message: str):
         self._toast(message)
+
+    def _status_event(self, message: str, level: str = "info"):
+        """Engine status stream: every level goes to the KVM log book (when
+        open); toasts keep the existing error-only policy."""
+        if getattr(self, "_logbook", None) is not None:
+            self._logbook.append(message, level)
+        self._toast(message, level)
+
+    def _kvm_diagnostics(self) -> dict:
+        return self.node.kvm.diagnostics()
+
+    def _toggle_logbook(self, icon=None, item=None):
+        logbook = getattr(self, "_logbook", None)
+        if logbook is not None:
+            self.post(logbook.toggle)
 
     def _refresh_menu_if_stale(self):
         now = time.monotonic()
@@ -239,7 +509,10 @@ class TrayApp:
 
     def _handle_session(self, session):
         if session.state == "denied" or session.error or not session.insession:
-            self._toast(f"Pairing with {session.peer_name} failed: {session.error or 'denied'}")
+            self._toast(
+                f"Pairing with {session.peer_name} failed: {session.error or 'denied'}",
+                level="error",
+            )
             return
         old = self._sessions.get(session.peer_fp)
         if old is not None and old is not session:
@@ -249,7 +522,6 @@ class TrayApp:
                 pass
         self._sessions[session.peer_fp] = session
         self._session_ts[session.peer_fp] = time.monotonic()
-        self._toast(f"Pairing with {session.peer_name} - PIN: {session.pin}")
         self._show_pair_dialog(session)
 
     # -- pairing popups -------------------------------------------------------
@@ -310,12 +582,8 @@ class TrayApp:
     def _pair_dialog_action(self, session, action):
         self._session_action(session, action)
         self._close_pair_dialog(session.peer_fp)
-        if action == "accept":
-            self._toast(f"Waiting for {session.peer_name} to confirm the PIN...")
-        elif action == "confirm":
-            self._toast(f"Paired with {session.peer_name}")
-        elif action == "deny":
-            self._toast(f"Pairing with {session.peer_name} denied")
+        if action == "deny":
+            self._toast(f"Pairing with {session.peer_name} denied", level="error")
 
     def _close_pair_dialog(self, fingerprint):
         win = self._pair_dialogs.pop(fingerprint, None)
@@ -357,7 +625,7 @@ class TrayApp:
             else:
                 session.deny()
         except Exception as exc:
-            self._toast(f"pairing error: {exc}")
+            self._toast(f"pairing error: {exc}", level="error")
 
     # -- transfers -----------------------------------------------------------
 
@@ -414,7 +682,6 @@ class TrayApp:
 
     def _tx_recv_done(self, info):
         self._tx_done(f"recv:{info['fingerprint']}:{info['name']}")
-        self._toast(f"Received {info['name']} -> {info['path']}")
 
     def _prune_stale_transfers(self, now):
         for tid, entry in list(self._transfers.items()):
@@ -510,6 +777,7 @@ class TrayApp:
         items = [
             pystray.MenuItem(lambda item: f"Name: {self._node_name()}", None, enabled=False),
             pystray.MenuItem(lambda item: f"Status: {self._status()}", None, enabled=False),
+            pystray.MenuItem(lambda item: f"Version: {version_label()}", None, enabled=False),
             pystray.Menu.SEPARATOR,
         ]
         transfer_items = self._transfer_items()
@@ -551,6 +819,9 @@ class TrayApp:
                 partial(self._toggle_kvm),
                 checked=lambda item: self._kvm_enabled(),
             )
+        )
+        items.append(
+            pystray.MenuItem("KVM log book…", partial(self._toggle_logbook))
         )
         items.append(self._kvm_setup_submenu())
         items.append(pystray.Menu.SEPARATOR)
@@ -665,7 +936,7 @@ class TrayApp:
                     flush=True,
                 )
         except Exception as exc:
-            self._toast(f"kvm error: {exc}")
+            self._toast(f"kvm error: {exc}", level="error")
 
     def _toggle_kvm_allowed(self, fingerprint, icon=None, item=None):
         self._set_kvm_allowed(fingerprint, not self._peer_kvm_allowed(fingerprint))
@@ -674,13 +945,13 @@ class TrayApp:
         try:
             self.node.store.set_peer_kvm_allowed(fingerprint, allowed)
         except Exception as exc:
-            self._toast(f"kvm error: {exc}")
+            self._toast(f"kvm error: {exc}", level="error")
 
     def _set_kvm_side(self, fingerprint, side, icon=None, item=None):
         try:
             self.node.store.set_peer_kvm_side(fingerprint, side)
         except Exception as exc:
-            self._toast(f"kvm error: {exc}")
+            self._toast(f"kvm error: {exc}", level="error")
 
     def _kvm_setup_submenu(self):
         peers = self._kvm_peers()
@@ -718,12 +989,16 @@ class TrayApp:
                         ),
                         pystray.Menu.SEPARATOR,
                         pystray.MenuItem(
-                            "Allow this device to control this Mac",
+                            f"Allow this device to control {self._node_name()}",
                             partial(self._toggle_kvm_allowed, fp),
                             checked=partial(self._peer_kvm_allowed, fp),
                         ),
                         pystray.Menu.SEPARATOR,
-                        pystray.MenuItem("This device is on this side of this Mac", None, enabled=False),
+                        pystray.MenuItem(
+                            f"This device is on this side of {self._node_name()}",
+                            None,
+                            enabled=False,
+                        ),
                         *side_items,
                     ),
                 )
@@ -741,7 +1016,7 @@ class TrayApp:
         """Per-peer KVM state. Link and control are separate on purpose."""
         try:
             link = self.node.kvm.link_status(fp)
-            control = self.node.kvm.control_state(fp)
+            control = self.node.kvm.control_label(fp)
         except Exception:
             link = "offline"
             control = "local"
@@ -749,6 +1024,8 @@ class TrayApp:
             return "off"
         if control == "controlling":
             return "controlling"
+        if control == "waiting_active":
+            return "waiting for peer"
         if control == "remote":
             return "controlled by peer"
         if control in ("requesting", "remote_preparing", "reverting"):
@@ -792,7 +1069,7 @@ class TrayApp:
             import traceback
 
             traceback.print_exc()
-            self._toast(f"sync error: {exc}")
+            self._toast(f"sync error: {exc}", level="error")
 
     def _pair_submenu(self, peers):
         def make_item(peer):
@@ -845,22 +1122,18 @@ class TrayApp:
             elif sys.platform == "win32":
                 os.startfile(self.download_dir)
         except Exception as exc:
-            self._toast(f"cannot open downloads: {exc}")
+            self._toast(f"cannot open downloads: {exc}", level="error")
 
     # -- actions (main thread; heavy work offloaded to threads) --------------
 
     def _start_pairing(self, peer):
-        if any(s.peer_fp == peer.fingerprint for s in self._sessions.values()):
-            self._toast("Pairing already in progress with this device")
-            return
-
         def worker():
             try:
                 # pair_with posts the session through on_session -> the UI
                 # already handles it (menu entry); nothing more to do here.
                 self.node.pair_with(peer.host, peer.port)
             except Exception as exc:
-                self.post(self._toast, f"pairing failed: {exc}")
+                self.post(self._toast, f"pairing failed: {exc}", "error")
 
         threading.Thread(target=worker, name="pair-init", daemon=True).start()
 
@@ -905,14 +1178,9 @@ class TrayApp:
                     peer.fingerprint, path, on_progress=self._post_progress_for(tid)
                 )
                 self.post(self._tx_done, tid)
-                self.post(
-                    self._toast,
-                    f"Sent {name} ({result['bytes']} B, "
-                    f"{result['mbps']:.0f} MB/s)",
-                )
             except Exception as exc:
                 self.post(self._tx_done, tid)
-                self.post(self._toast, f"send failed: {exc}")
+                self.post(self._toast, f"send failed: {exc}", "error")
 
         threading.Thread(target=worker, name="send-file", daemon=True).start()
 
@@ -930,21 +1198,81 @@ class TrayApp:
         self._prepare_dialog()
         if messagebox.askyesno("SecureShare", f"Unpair {name}?"):
             self.node.store.remove_peer(fingerprint)
-            self._toast(f"Unpaired {name}")
+
+
+def parse_share_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split raw argv into (options for argparse, share files).
+
+    Handles the three launch shapes that carry files:
+      - secureshare://send?files=...  (Share Extension URL scheme)
+      - -sendFile <path> [-sendFile <path> ...]  (Finder Services)
+      - plain paths                    (Windows right-click / Send to)
+    macOS LaunchServices also passes a -psn_<n> serial, which is dropped.
+    """
+    rest = []
+    files = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("secureshare://"):
+            files.extend(share_files_from_url(arg))
+            i += 1
+            continue
+        if arg == "-sendFile" and i + 1 < len(argv):
+            files.append(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("-psn_"):
+            i += 1
+            continue
+        rest.append(arg)
+        i += 1
+    return rest, files
 
 
 def main():
+    rest, flag_files = parse_share_argv(sys.argv[1:])
+
     parser = argparse.ArgumentParser(description="SecureShare tray app")
     parser.add_argument("--name", help="device name shown to peers")
     parser.add_argument("--data-dir", help="where trust data is stored")
     parser.add_argument("--download-dir", help="where received files go")
     parser.add_argument("--port", type=int, help="transfer listener port")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--max-transfer-size",
+        type=int,
+        help="maximum accepted transfer size in bytes (default 10 GiB)",
+    )
+    parser.add_argument(
+        "--trusted-subnets",
+        help="comma-separated CIDRs allowed to connect (e.g. 192.168.1.0/24); "
+        "default: any LAN peer",
+    )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args(rest)
+
+    share_files = []
+    share_files.extend(flag_files)
+    share_files.extend(args.files or [])
+    share_files = [f for f in share_files if os.path.isfile(f)]
+
+    if share_files:
+        # A primary instance is already running: hand the files over and exit.
+        if forward_share_request(share_files):
+            return
+
     TrayApp(
         name=args.name,
         data_dir=args.data_dir,
         download_dir=args.download_dir,
         port=args.port,
+        max_transfer_size=args.max_transfer_size,
+        trusted_subnets=args.trusted_subnets,
+        initial_share_files=share_files or None,
     ).run()
 
 

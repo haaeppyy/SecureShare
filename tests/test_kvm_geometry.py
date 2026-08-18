@@ -1,5 +1,3 @@
-import time
-
 import pytest
 
 from core.kvm_geometry import (
@@ -7,7 +5,6 @@ from core.kvm_geometry import (
     GeometryError,
     Monitor,
     ScreenLayout,
-    ScreenLayoutCache,
     clamp_to_edge,
     in_jump_zone,
     map_to_peer,
@@ -113,7 +110,7 @@ def test_map_to_peer_clamps_fraction():
 
 def test_entry_point_lands_past_the_return_zone():
     peer = ScreenLayout([Monitor(0, 0, 1920, 1080)])
-    assert entry_point(peer, "right", 0.5) == (JUMP_ZONE + 1, 539)
+    assert entry_point(peer, "right", 0.5) == (48, 539)
 
 
 def test_topology():
@@ -132,48 +129,8 @@ def test_offscreen_monitor_union():
 
 def test_scale_conversion():
     assert pt_to_px(100, 2.0) == 200
-
-
-def test_layout_cache_computes_once():
-    calls = {"n": 0}
-
-    def compute():
-        calls["n"] += 1
-        return layout()
-
-    cache = ScreenLayoutCache(compute, max_age_s=10.0)
-    for _ in range(3):
-        assert cache.get() is cache.get()
-    assert calls["n"] == 1
-
-
-def test_layout_cache_invalidate_recomputes():
-    calls = {"n": 0}
-
-    def compute():
-        calls["n"] += 1
-        return layout()
-
-    cache = ScreenLayoutCache(compute, max_age_s=10.0)
-    cache.get()
-    cache.invalidate()
-    cache.get()
-    assert calls["n"] == 2
-
-
-def test_layout_cache_ttl_expiry():
-    calls = {"n": 0}
-
-    def compute():
-        calls["n"] += 1
-        return layout()
-
-    cache = ScreenLayoutCache(compute, max_age_s=0.05)
-    cache.get()
-    cache.get()
-    assert calls["n"] == 1
-    time.sleep(0.08)
-    cache.get()
-    assert calls["n"] == 2
     assert px_to_pt(200, 2.0) == 100
     assert pt_to_px(0, 1.0) == 0
+
+
+pytestmark = pytest.mark.unit

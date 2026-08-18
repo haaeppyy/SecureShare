@@ -5,6 +5,8 @@ import os
 
 from core.trust_store import TrustStore
 
+import pytest
+
 
 def test_identity_persists(tmp_path):
     store = TrustStore(data_dir=str(tmp_path), keyring_enabled=False)
@@ -49,3 +51,5 @@ def test_sync_enabled_flag_persists(tmp_path):
     store.set_sync_enabled(True)
     reloaded = TrustStore(data_dir=str(tmp_path), keyring_enabled=False)
     assert reloaded.sync_enabled is True
+
+pytestmark = pytest.mark.unit
