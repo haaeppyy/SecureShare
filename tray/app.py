@@ -25,6 +25,8 @@ from functools import partial
 import pystray
 from PIL import Image, ImageDraw
 
+from core.version import version_label
+
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -132,7 +134,7 @@ class TrayApp:
             port=self.port or DEFAULT_PORT,
             max_transfer_size=self.max_transfer_size,
             trusted_subnets=self.trusted_subnets,
-            on_status=lambda s, level="info": self.post(self._toast, s, level),
+            on_status=lambda s, level="info": self.post(self._status_event, s, level),
             on_incoming_pair=lambda s: self.post(self._handle_session, s),
             on_transfer_start=lambda i: self.post(
                 self._tx_start, "recv", i["fingerprint"], i["from"], i["name"], i["size"]
@@ -150,6 +152,10 @@ class TrayApp:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
+
+        from tray.logbook import LogBook
+
+        self._logbook = LogBook(self.root, dump_diag=self._kvm_diagnostics)
 
         icon_options = {}
         if sys.platform == "darwin":
@@ -364,6 +370,7 @@ class TrayApp:
             or self._pair_dialogs
             or self._transfer_window is not None
             or self._share_dialog is not None
+            or (getattr(self, "_logbook", None) is not None and self._logbook.open)
         ):
             return self.BUSY_PUMP_INTERVAL
         return self.IDLE_PUMP_INTERVAL
@@ -436,6 +443,21 @@ class TrayApp:
 
     def _log(self, message: str):
         self._toast(message)
+
+    def _status_event(self, message: str, level: str = "info"):
+        """Engine status stream: every level goes to the KVM log book (when
+        open); toasts keep the existing error-only policy."""
+        if getattr(self, "_logbook", None) is not None:
+            self._logbook.append(message, level)
+        self._toast(message, level)
+
+    def _kvm_diagnostics(self) -> dict:
+        return self.node.kvm.diagnostics()
+
+    def _toggle_logbook(self, icon=None, item=None):
+        logbook = getattr(self, "_logbook", None)
+        if logbook is not None:
+            self.post(logbook.toggle)
 
     def _refresh_menu_if_stale(self):
         now = time.monotonic()
@@ -755,6 +777,7 @@ class TrayApp:
         items = [
             pystray.MenuItem(lambda item: f"Name: {self._node_name()}", None, enabled=False),
             pystray.MenuItem(lambda item: f"Status: {self._status()}", None, enabled=False),
+            pystray.MenuItem(lambda item: f"Version: {version_label()}", None, enabled=False),
             pystray.Menu.SEPARATOR,
         ]
         transfer_items = self._transfer_items()
@@ -796,6 +819,9 @@ class TrayApp:
                 partial(self._toggle_kvm),
                 checked=lambda item: self._kvm_enabled(),
             )
+        )
+        items.append(
+            pystray.MenuItem("KVM log book…", partial(self._toggle_logbook))
         )
         items.append(self._kvm_setup_submenu())
         items.append(pystray.Menu.SEPARATOR)

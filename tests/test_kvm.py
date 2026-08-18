@@ -388,6 +388,48 @@ def test_revert_sequence_recorded_in_diagnostics(node_pair_ctx):
     assert "handoffs" in diag and "denial_latch" in diag
 
 
+def test_revert_grace_expires_allowing_edge_retake(node_pair_ctx):
+    """The former-controller latch must be time-bounded for reverts: while
+    the grace window is active the restored cursor position cannot re-take
+    control; once it expires, moving back to the edge does."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    plat_b.move(1, 0)  # physical local input on the target -> revert
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    assert ok
+    assert pair.a.kvm._blocked_edge.get(fp_b) == "right"
+    # Inside the grace window the restored cursor (4 px inside the seam,
+    # inside LATCH_ZONE) cannot re-take, even at the seam.
+    plat_a.move(4, 0)  # (1440, 450): exactly on the seam
+    assert pair.a.kvm._state.get(fp_b) == "local", "grace window did not hold"
+    # Expire the grace: the same deliberate move now re-takes control.
+    pair.a.kvm._blocked_until[fp_b] = time.monotonic() - 1
+    plat_a.move(1, 0)
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "controlling", timeout=5)
+    assert ok, "re-take after the grace window failed"
+    assert fp_b not in pair.a.kvm._blocked_edge
+
+
+def test_refusal_latch_never_expires(node_pair_ctx):
+    """Refusals stay spatial-only: the blocked edge must not silently
+    expire while the cursor sits on the rejected seam (no refusal-toast
+    spam every REVERT_GRACE seconds)."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    pair.b.store.set_peer_kvm_allowed(pair.a.store.fingerprint(), False)
+    fp_b = pair.b.store.fingerprint()
+    plat_a.move(740, 0)
+    ok = wait_for(lambda: pair.a.kvm._blocked_edge.get(fp_b) is not None, timeout=5)
+    assert ok, "A should have been refused"
+    # refusals get no grace deadline: the latch must stay spatial-only
+    assert pair.a.kvm._blocked_until.get(fp_b, float("inf")) == float("inf")
+    plat_a.move(1, 0)  # wiggle on the edge
+    assert pair.a.kvm._state.get(fp_b) == "local", "refusal latch must not expire"
+    assert pair.a.kvm._blocked_edge.get(fp_b) == "right"
+
+
 def test_reverse_direction_handoff_after_handback(node_pair_ctx):
     """After B takes its control back, B can immediately cross to its own
     edge and control A: the former-controller latch must not block the new
@@ -1236,16 +1278,19 @@ def test_f4_concurrent_callback_and_reader_traffic(node_pair_ctx):
 
 def test_f5_local_input_revert_reports_origin(node_pair_ctx):
     """F5: reverts must say which local input path triggered them, so a
-    stuck "input on the target" episode is diagnosable."""
+    stuck "input on the target" episode is diagnosable.  The origin is
+    generated on the target and must reach the controller's status line
+    over the wire."""
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
     take_control(pair, plat_a, plat_b)
     toasts = []
-    pair.b.kvm.on_status = lambda m, level="info": toasts.append((m, level))
+    pair.a.kvm.on_status = lambda m, level="info": toasts.append((m, level))
     pair.b.kvm._capture_origin = "mac"
     plat_b.move(10, 0)
-    ok = wait_for(lambda: any("mac-pointer" in m for m, _ in toasts))
-    assert ok, f"pointer origin missing from toasts: {toasts}"
+    ok = wait_for(lambda: any("physical mouse moved" in m for m, _ in toasts))
+    assert ok, f"pointer origin missing from controller toasts: {toasts}"
+    assert pair.a.kvm.control_state(pair.b.store.fingerprint()) == "local"
     assert pair.b.kvm.control_state(pair.a.store.fingerprint()) == "local"
     ok = wait_for(lambda: pair.a.kvm.control_state(pair.b.store.fingerprint()) == "local", timeout=5)
     assert ok, f"A never reverted; got {pair.a.kvm.control_state(pair.b.store.fingerprint())}"
@@ -1256,8 +1301,8 @@ def test_f5_local_input_revert_reports_origin(node_pair_ctx):
     take_control(pair, plat_a, plat_b)
     pair.b.kvm._capture_origin = "win"
     plat_b.press(mac_vk_to_hid(0x00))
-    ok = wait_for(lambda: any("win-key" in m for m, _ in toasts))
-    assert ok, f"key origin missing from toasts: {toasts}"
+    ok = wait_for(lambda: any("physical keyboard input" in m for m, _ in toasts))
+    assert ok, f"key origin missing from controller toasts: {toasts}"
 
 
 def test_f7_keyboard_stall_escalation_and_recovery(tmp_path):

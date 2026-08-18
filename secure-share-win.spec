@@ -9,6 +9,27 @@
 #   - The tray icon is embedded via datas; pystray finds it relative to
 #     the bundled path (see tray/app.py load_icon).
 
+import subprocess
+
+
+def _build_tag():
+    """Git short hash at build time (the tray shows Version: x.y.z (hash)
+    so both devices can be verified on the same build)."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        return out or "dev"
+    except Exception:
+        return "dev"
+
+
+with open("core/_build_tag.py", "w", encoding="utf-8") as f:
+    f.write(f"BUILD_TAG = {_build_tag()!r}\n")
+
 hiddenimports = [
     "keyring.backends",
     "keyring.backends.Windows",

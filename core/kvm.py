@@ -123,6 +123,13 @@ KEEPALIVE_INTERVAL = 2.0
 HANDOFF_TIMEOUT = 1.5
 HANDSHAKE_TIMEOUT = 5.0
 MAX_FRAME = 1 << 20
+# After the controlled device takes control back, the former controller's
+# edge stays latched for this long (position-independent): residual motion
+# right after the revert cannot re-acquire control, but a deliberate move
+# to the edge a moment later can (the old spatial-only latch never cleared
+# from the restored cursor position, so the Mac could not take control
+# back at all).
+REVERT_GRACE = 2.0
 COUNTER_LIMIT = 1 << 31
 MAX_PENDING_KVM = 8        # concurrent unauthenticated opening connections
 MAX_PENDING_KVM_PER_IP = 4
@@ -138,6 +145,38 @@ def _set_low_latency(conn) -> None:
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError:
         pass
+
+
+def _friendly_reason(reason: str) -> str:
+    """Human-readable reason for the status line / log book.  Machine
+    codes stay as-is in the structured request/revert logs."""
+    table = {
+        "local input": "local input on the controlled device",
+        "local-pointer": "local pointer moved",
+        "local-key": "local keyboard input",
+        "mac-pointer": "physical mouse moved on the controlled device",
+        "win-pointer": "physical mouse moved on the controlled device",
+        "mac-key": "physical keyboard input on the controlled device",
+        "win-key": "physical keyboard input on the controlled device",
+        "peer-edge": "cursor reached the edge on the controlled device",
+        "escape": "escape chord (Ctrl+Option+Space) pressed",
+        "escape chord": "escape chord (Ctrl+Option+Space) pressed",
+        "handoff timeout": "handoff timed out",
+        "peer refused": "the controlled device refused",
+        "layout mismatch": "screen layout mismatch",
+        "peer: denied": "the controlled device refused (consent off)",
+        "peer: topology": "the controlled device rejected (screen layout mismatch)",
+        "peer: busy": "the controlled device was busy",
+        "peer: unavailable": "the controlled device has no input platform",
+        "peer: closed": "the connection closed",
+        "peer: edge-left": "the cursor left the edge",
+        "peer: withdrawn": "the takeover was withdrawn",
+        "peer: timeout": "handoff timed out",
+        "peer: platform": "input platform failure on the controlled device",
+        "platform": "input platform failure",
+        "channel lost": "the connection was lost",
+    }
+    return table.get(reason, reason)
 
 # Control states (per peer).
 STATE_LOCAL = "local"
@@ -533,6 +572,9 @@ class KVMEngine:
         # Edge that a refused handoff keeps blocked until the pointer
         # leaves it (at most one refusal message per edge dwell).
         self._blocked_edge: dict[str, str] = {}
+        # Revert latches expire after REVERT_GRACE (monotonic deadline per
+        # peer); refusals set no deadline and stay spatial-only.
+        self._blocked_until: dict[str, float] = {}
         # Target side: while a peer's request was refused, ignore further
         # requests (and notifications) until that peer cancels / the
         # channel changes.
@@ -697,6 +739,7 @@ class KVMEngine:
         """Force every local/remote control state back to local."""
         self._handoffs.clear()
         self._blocked_edge.clear()
+        self._blocked_until.clear()
         self._denial_latch.clear()
         self._last_sent_id.clear()
         self._local_pressed.clear()
@@ -1073,10 +1116,18 @@ class KVMEngine:
             # inside the seam, so an 8 px latch zone keeps the former
             # controller from re-acquiring on residual motion.
             latch_side = self._cursor_side(x, y, LATCH_ZONE)
+            now = time.monotonic()
             for fp in list(self._blocked_edge):
                 if latch_side is None or latch_side != self._blocked_edge[fp]:
                     self._blocked_edge.pop(fp, None)
+                    self._blocked_until.pop(fp, None)
                     self._send_edge_left_cancel(fp)
+                elif now >= self._blocked_until.get(fp, float("inf")):
+                    # Revert latch expired: the deliberate move to the edge
+                    # is allowed again (refusals never expire - they stay
+                    # silent until the pointer leaves the edge).
+                    self._blocked_edge.pop(fp, None)
+                    self._blocked_until.pop(fp, None)
             channel = self._active_channel()
             if channel is not None:
                 self._on_active_local_mouse(channel, dx, dy, x, y, handoff_side)
@@ -1378,7 +1429,7 @@ class KVMEngine:
             self._fail_controller(channel, rec, "platform", f"platform failure: {exc}")
             return
         channel.send_event(KIND_CONTROL_BEGIN, encode_handoff_id(hid))
-        self.on_status(f"Controlling {channel.peer_name} (waiting for remote)")
+        self.on_status(f"Took control of {channel.peer_name}")
 
     def _on_control_active(self, channel: KvmChannel, body: bytes) -> None:
         try:
@@ -1433,7 +1484,7 @@ class KVMEngine:
             self._fail_target(channel, rec, "platform", f"platform failure: {exc}")
             return
         channel.send_event(KIND_CONTROL_ACTIVE, encode_handoff_id(hid))
-        self.on_status(f"{channel.peer_name} controls this device")
+        self.on_status(f"{channel.peer_name} took control of this device")
 
     # -- handoff: target side --------------------------------------------------
 
@@ -1530,6 +1581,7 @@ class KVMEngine:
             # explicit withdrawal is not a refusal and must not block.
             if reason != "withdrawn":
                 self._blocked_edge[fp] = self._my_side_for(fp)
+                self._blocked_until.pop(fp, None)
             self._revert_control(channel, f"peer: {reason}")
             return
         self._revert_remote(channel, f"peer: {reason}")
@@ -1550,11 +1602,12 @@ class KVMEngine:
             self._revert_remote(channel, f"{reason}")
         else:
             # A target-driven revert restores our cursor just inside the
-            # seam; latch that edge so residual motion cannot immediately
-            # re-acquire control.  The latch clears once the pointer leaves
-            # the LATCH_ZONE (on_local_mouse).
+            # seam; the REVERT_GRACE window keeps the former controller
+            # from re-acquiring on residual motion, then expires so a
+            # deliberate move to the edge can take control back.
             if rec["role"] == "controller" and state in (STATE_CONTROLLING, STATE_REQUESTING):
                 self._blocked_edge[fp] = self._my_side_for(fp)
+                self._blocked_until[fp] = time.monotonic() + REVERT_GRACE
             self._revert_control(channel, f"{reason}")
 
     # -- platform failure -> safe revert ---------------------------------------
@@ -1599,8 +1652,8 @@ class KVMEngine:
         self._state[fp] = STATE_LOCAL
         self._log_transition(fp, STATE_LOCAL, None, hid, combined)
         self._note_revert(hid, "completed", STATE_LOCAL)
-        suffix = f" ({origin}, {reason})" if origin else f" ({reason})"
-        self.on_status(f"Control returned from {channel.peer_name}{suffix}")
+        suffix = f" ({_friendly_reason(reason)})" if reason else ""
+        self.on_status(f"Released control of {channel.peer_name}{suffix}")
 
     def _revert_remote(self, channel: KvmChannel, reason: str, origin: str = None) -> None:
         if channel is None:
@@ -1620,8 +1673,8 @@ class KVMEngine:
         self._state[fp] = STATE_LOCAL
         self._log_transition(fp, STATE_LOCAL, None, hid, combined)
         self._note_revert(hid, "completed", STATE_LOCAL)
-        suffix = f" ({origin}, {reason})" if origin else f" ({reason})"
-        self.on_status(f"{channel.peer_name} released control{suffix}")
+        suffix = f" ({_friendly_reason(reason)})" if reason else ""
+        self.on_status(f"Control taken back by {channel.peer_name}{suffix}")
 
     def _restore_local_delegation(self, attempts: int = 3) -> bool:
         """Force the platform back to local delegation and show the cursor.
@@ -1898,6 +1951,7 @@ class KVMEngine:
             state = self._state.pop(fp, None)
             self._handoffs.pop(fp, None)
             self._blocked_edge.pop(fp, None)
+            self._blocked_until.pop(fp, None)
             self._denial_latch.pop(fp, None)
             self._last_sent_id.pop(fp, None)
             self._link_status.pop(fp, None)

@@ -11,7 +11,30 @@
 #   - The app bundle must be built on macOS (tkinter, pyobjc and zeroconf
 #     are all platform-bound).
 
+import subprocess
+
 from PyInstaller.utils.hooks import collect_submodules
+
+
+def _build_tag():
+    """Git short hash at build time (the tray shows Version: x.y.z (hash)
+    so both devices can be verified on the same build)."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        return out or "dev"
+    except Exception:
+        return "dev"
+
+
+with open("core/_build_tag.py", "w", encoding="utf-8") as f:
+    f.write(f"BUILD_TAG = {_build_tag()!r}\n")
+
+from core import version  # noqa: E402
 
 hiddenimports = [
     "keyring.backends",
@@ -68,6 +91,8 @@ app = BUNDLE(
     icon="tray/icons/tray_256.png",
     bundle_identifier="com.secureshare.app",
     info_plist={
+        "CFBundleShortVersionString": version.APP_VERSION,
+        "CFBundleVersion": f"{version.APP_VERSION}.{version.BUILD_TAG}",
         "LSUIElement": True,
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription": "",

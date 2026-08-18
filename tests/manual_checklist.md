@@ -186,20 +186,40 @@ F6 diagnostics now expose `handoffs` (id/role/stage per peer),
 `ignored reason=denial_latch|duplicate`. Reverts record `accepted` on
 wire-match, then `completed` once both sides are local.
 
+Version parity: both devices must show the SAME `Version: x.y.z (hash)`
+in the tray menu (hash = git short hash baked in at build time); rebuild
+with `git pull origin KVM` + the spec when they differ.
+
+Log book: tray menu → `KVM log book…` shows the timestamped status
+stream (control taken/released on both sides, refusals with reasons);
+`Dump diagnostics` prints the engine + platform records.
+
+- [ ] Version parity: Mac and Windows tray menus show identical
+      `Version:` labels.
+- [ ] Log book: Mac controls Windows → Mac's log book shows
+      "Took control of <Windows>"; Windows' shows "<Mac> took control of
+      this device".
+- [ ] Revert with reason: Windows physical mouse moves → both log books
+      show the release with "physical mouse moved on the controlled
+      device"; escape chord shows the chord reason.
 - [ ] Held keys repeat (Regression 1): Mac controls Windows, hold
       Backspace → characters delete repeatedly (Windows does not
       auto-repeat SendInput, the Mac forwards autorepeat events now).
 - [ ] No jitter / no handback under a sustained stream (Regression 2):
       Mac controls Windows and moves the mouse continuously for ~30 s →
-      the Windows cursor is smooth, no flicker, no "Control returned"
+      the Windows cursor is smooth, no flicker, no "Released control"
       toast; Windows' `reverts_sent` stays 0 and `request_log` shows no
       new request mid-stream.
 - [ ] Windows physical reclaim: while Mac controls Windows, move the
       Windows mouse → both become local, `revert_log` shows
       `accepted` then `completed state=local` on the Mac.
-- [ ] Reverse direction (Regression 3): with the Windows cursor away
-      from its edge, cross Windows' seam once → Windows controls the
-      Mac; Mac's `last_request` decision is `accepted` even while its
+- [ ] Mac re-take after handback (Regression 3 fix): after Windows
+      reclaims, move the Mac cursor straight to the edge again (no need
+      to pull it away first) → Mac takes control again once the 2 s
+      grace has passed.
+- [ ] Reverse direction (Windows controls Mac): with the Windows cursor
+      away from its edge, cross Windows' seam once → Windows controls
+      the Mac; Mac's `last_request` decision is `accepted` even while its
       former-controller edge latch is set (`blocked_edges` non-empty).
       If it fails, read `last_request` / `request_log` on the Mac:
       `rejected reason=denied` (consent off) vs `topology` (seam
