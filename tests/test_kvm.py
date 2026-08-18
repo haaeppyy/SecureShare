@@ -239,6 +239,27 @@ def test_take_control_and_drive(node_pair_ctx):
     assert ("rel", 5, 5) not in plat_b.injected
 
 
+def test_key_autorepeat_forwarded_to_target(node_pair_ctx):
+    """Held keys repeat on the target: every controller key-down (initial
+    and autorepeat) is injected, and the key-up exactly once. The Windows
+    SendInput injector does not auto-repeat, so repeats must travel."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = take_control(pair, plat_a, plat_b)
+    hid = mac_vk_to_hid(0x33)  # Backspace
+    for _ in range(3):
+        pair.a.kvm.on_local_key(hid, True)
+    pair.a.kvm.on_local_key(hid, False)
+    ok = wait_for(
+        lambda: sum(1 for i in plat_b.injected if i == ("key", hid, True)) >= 3,
+        timeout=5,
+    )
+    assert ok, f"repeated key-downs never reached B; got {plat_b.injected}"
+    assert sum(1 for i in plat_b.injected if i == ("key", hid, False)) == 1
+    assert pair.a.kvm._state.get(fp_b) == "controlling"
+    assert plat_b.delegation == "remote"
+
+
 def test_no_suppression_before_active(node_pair_ctx, monkeypatch):
     """The controller must not swallow local input before CONTROL_ACTIVE."""
     pair, plat_a, plat_b = node_pair_ctx
@@ -336,6 +357,37 @@ def test_handback_blocks_former_controller_edge(node_pair_ctx):
     assert pair.a.kvm.diagnostics()["blocked_edges"].get(fp_b) is None
 
 
+def test_revert_sequence_recorded_in_diagnostics(node_pair_ctx):
+    """A matched target-originated revert records accepted -> completed in
+    the revert log, walks controlling -> reverting -> local, clears the
+    handoff, and leaves the former-controller edge latch set."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    plat_b.move(1, 0)  # physical local input on the target -> revert
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    assert ok, "A never handed back control"
+    # structured revert log: accepted then completed
+    phases = [r["phase"] for r in pair.a.kvm._revert_log]
+    assert phases[-2:] == ["accepted", "completed"], phases
+    assert pair.a.kvm._last_revert["state"] == "local"
+    assert pair.a.kvm._last_revert["id"] == pair.a.kvm._revert_log[-1]["id"]
+    # transition sequence: controlling -> reverting -> local
+    states = [t[2] for t in pair.a.kvm.recent_transitions() if t[1] == fp_b]
+    assert "reverting" in states
+    assert states[-1] == "local"
+    # handoff cleared, former-controller latch set
+    assert fp_b not in pair.a.kvm._handoffs
+    assert pair.a.kvm._blocked_edge.get(fp_b) == "right"
+    assert pair.a.kvm.diagnostics()["blocked_edges"].get(fp_b) == "right"
+    # diagnostics expose the new fields
+    diag = pair.a.kvm.diagnostics()
+    assert "last_revert" in diag and "revert_log" in diag
+    assert "last_request" in diag and "request_log" in diag
+    assert "handoffs" in diag and "denial_latch" in diag
+
+
 def test_reverse_direction_handoff_after_handback(node_pair_ctx):
     """After B takes its control back, B can immediately cross to its own
     edge and control A: the former-controller latch must not block the new
@@ -356,6 +408,13 @@ def test_reverse_direction_handoff_after_handback(node_pair_ctx):
     assert ok, "B never took control of A"
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "remote", timeout=5)
     assert ok, "A never entered remote"
+    # A's former-controller latch for B was still set while B's inbound
+    # request was accepted: the latch must not block incoming takeovers.
+    assert pair.b.kvm._last_request["decision"] == "accepted"
+    assert pair.a.kvm._last_request is None or pair.a.kvm._last_request["decision"] in (
+        "accepted",
+        "ignored",
+    )
     assert plat_b.delegation == "controlling"
     assert plat_a.delegation == "remote"
 
@@ -446,6 +505,30 @@ def test_controller_delegation_single_association_until_revert(node_pair_ctx):
     )
 
 
+def test_sustained_relative_motion_does_not_handback(node_pair_ctx):
+    """A sustained, coalesced stream of relative motion while the target is
+    remote must keep both state machines active and never emit a revert:
+    relative injection is sentinel-tagged transport, not physical input."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = take_control(pair, plat_a, plat_b)
+    fp_a = pair.a.store.fingerprint()
+    for _ in range(300):
+        plat_a.move(3, 2)
+    ok = wait_for(
+        lambda: sum(r[1] for r in plat_b.injected if r[0] == "rel") >= 900, timeout=10
+    )
+    assert ok, f"sustained motion never reached B; got {plat_b.injected[-5:]}"
+    assert sum(r[1] for r in plat_b.injected if r[0] == "rel") == 900
+    assert sum(r[2] for r in plat_b.injected if r[0] == "rel") == 600
+    assert pair.a.kvm._state.get(fp_b) == "controlling"
+    assert pair.b.kvm._state.get(fp_a) == "remote"
+    assert pair.b.kvm._stats.get("reverts_sent", 0) == 0, (
+        "relative injection must never look like physical input"
+    )
+    assert pair.a.kvm.platform.delegation == "controlling"
+
+
 def test_hand_back_releases_pressed_keys(node_pair_ctx):
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
@@ -474,6 +557,8 @@ def test_remote_rejects_without_consent(node_pair_ctx):
     assert pair.a.kvm._state.get(fp_b) == "local"
     assert pair.a.kvm.platform.delegation == "local"
     assert plat_b.delegation == "local"
+    assert pair.b.kvm._last_request["decision"] == "rejected"
+    assert pair.b.kvm._last_request["reason"] == "denied"
     # the controller edge is blocked while the pointer stays on it: wiggling
     # must not spam new attempts
     plat_a.move(1, 0)
@@ -523,6 +608,85 @@ def test_remote_side_change_breaks_takeover(node_pair_ctx):
     plat_a.move(740, 0)
     assert pair.a.kvm._state.get(pair.b.store.fingerprint()) != "controlling"
     assert plat_b.delegation == "local"
+
+
+def test_control_request_decision_records(node_pair_ctx):
+    """Every incoming CONTROL_REQUEST records a structured decision for F6
+    diagnostics: accepted, or rejected/ignored with its reason."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_a = pair.a.store.fingerprint()
+    ch = pair.b.kvm._channels[fp_a]
+
+    def request(hid, channel=ch):
+        pair.b.kvm._on_control_request(channel, encode_control_request(hid, 200, 450, 0))
+
+    # accepted: request becomes the in-flight handoff
+    request(101)
+    assert pair.b.kvm._last_request["decision"] == "accepted"
+    assert pair.b.kvm._last_request["id"] == 101
+    assert pair.b.kvm._state.get(fp_a) == "remote_preparing"
+    # cleanup: cancel the accepted handoff back to local
+    pair.b.kvm._revert_remote(ch, "test cleanup")
+    assert pair.b.kvm._state.get(fp_a) == "local"
+
+    # duplicate of the in-flight attempt
+    request(102)
+    assert pair.b.kvm._last_request["decision"] == "accepted"
+    request(102)
+    assert pair.b.kvm._last_request["decision"] == "ignored"
+    assert pair.b.kvm._last_request["reason"] == "duplicate"
+    pair.b.kvm._revert_remote(ch, "test cleanup")
+
+    # denial latch: silent while the pointer stays on the rejected edge
+    pair.b.kvm._denial_latch[fp_a] = "denied"
+    request(103)
+    assert pair.b.kvm._last_request["decision"] == "ignored"
+    assert pair.b.kvm._last_request["reason"] == "denial_latch"
+    del pair.b.kvm._denial_latch[fp_a]
+
+    # denied: no consent
+    pair.b.store.set_peer_kvm_allowed(fp_a, False)
+    request(104)
+    assert pair.b.kvm._last_request["decision"] == "rejected"
+    assert pair.b.kvm._last_request["reason"] == "denied"
+    pair.b.store.set_peer_kvm_allowed(fp_a, True)
+    del pair.b.kvm._denial_latch[fp_a]
+
+    # topology: seam sides disagree
+    pair.b.kvm._topology_ok[fp_a] = False
+    request(105)
+    assert pair.b.kvm._last_request["decision"] == "rejected"
+    assert pair.b.kvm._last_request["reason"] == "topology"
+    del pair.b.kvm._topology_ok[fp_a]
+    del pair.b.kvm._denial_latch[fp_a]
+
+    # busy: another active handoff is in flight
+    pair.b.kvm._state["other"] = "remote"
+    request(106)
+    assert pair.b.kvm._last_request["decision"] == "rejected"
+    assert pair.b.kvm._last_request["reason"] == "busy"
+    del pair.b.kvm._state["other"]
+
+    # unavailable: no input platform
+    pair.b.kvm.platform = None
+    request(107)
+    assert pair.b.kvm._last_request["decision"] == "rejected"
+    assert pair.b.kvm._last_request["reason"] == "unavailable"
+    pair.b.kvm.platform = plat_b
+
+    # closed: channel is gone
+    class ClosedChannel:
+        peer_fp = fp_a
+        peer_name = "BetaBox"
+        closed = True
+
+    request(108, ClosedChannel())
+    assert pair.b.kvm._last_request["decision"] == "rejected"
+    assert pair.b.kvm._last_request["reason"] == "closed"
+    # nothing was created for the closed path
+    assert fp_a not in pair.b.kvm._handoffs
+    assert pair.b.kvm._state.get(fp_a) == "local"
 
 
 def test_simultaneous_takeover(fp_pair):

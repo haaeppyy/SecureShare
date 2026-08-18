@@ -254,17 +254,52 @@ def test_key_forwarding_survives_pyobjc_without_keyrepeat_attr(monkeypatch):
         quartz.kCGKeyboardEventAutorepeat: 0,
         quartz.kCGKeyboardEventKeycode: 0x00,  # 'a'
     }
+    # initial key-down, autorepeat key-down, then key-up
     platform._forward(event, quartz.kCGEventKeyDown)
-    platform._forward(event, quartz.kCGEventKeyUp)
-    assert seen == [(0x04, True), (0x04, False)], seen
-
     event[quartz.kCGKeyboardEventAutorepeat] = 1
     platform._forward(event, quartz.kCGEventKeyDown)
-    assert seen == [(0x04, True), (0x04, False)], "autorepeat must be filtered"
+    event[quartz.kCGKeyboardEventAutorepeat] = 0
+    platform._forward(event, quartz.kCGEventKeyUp)
+    assert seen == [(0x04, True), (0x04, True), (0x04, False)], seen
 
-    assert platform._stats["tap_keys"] == 3
-    assert platform._stats["hid_mapped"] == 2
+    event[quartz.kCGKeyboardEventAutorepeat] = 1
+    platform._forward(event, quartz.kCGEventKeyUp)
+    assert seen == [(0x04, True), (0x04, True), (0x04, False)], (
+        "anomalous repeat-marked key-up must be ignored"
+    )
+
+    assert platform._stats["tap_keys"] == 4
+    assert platform._stats["hid_mapped"] == 3
     assert platform._stats["exceptions"] == 0, "no key may raise an exception"
+
+
+def test_key_forwarding_in_remote_mode_forwards_autorepeat(monkeypatch):
+    """_forward_keys (remote mode) must also forward autorepeat key-downs:
+    the emergency chord and held-key handling need the repeats."""
+    quartz = _QuartzNoKeyRepeat()
+    monkeypatch.setattr(mac, "Quartz", quartz)
+    monkeypatch.setattr(mac, "_QUARTZ_OK", True)
+    platform = mac.MacInputPlatform()
+    seen = []
+
+    class Engine:
+        def on_local_key(self, hid, down):
+            seen.append((hid, down))
+
+    platform.engine = Engine()
+    event = {
+        quartz.kCGEventSourceUserData: 0,
+        quartz.kCGEventSourceUnixProcessID: 0,
+        quartz.kCGKeyboardEventAutorepeat: 0,
+        quartz.kCGKeyboardEventKeycode: 0x00,  # 'a'
+    }
+    platform._forward_keys(event, quartz.kCGEventKeyDown)
+    event[quartz.kCGKeyboardEventAutorepeat] = 1
+    platform._forward_keys(event, quartz.kCGEventKeyDown)
+    event[quartz.kCGKeyboardEventAutorepeat] = 0
+    platform._forward_keys(event, quartz.kCGEventKeyUp)
+    assert seen == [(0x04, True), (0x04, True), (0x04, False)], seen
+    assert platform._stats["exceptions"] == 0
 
 
 pytestmark = pytest.mark.unit

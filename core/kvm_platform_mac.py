@@ -271,16 +271,24 @@ class MacInputPlatform:
         if user == SENTINEL or (pid and pid == os.getpid()):
             return
         try:
-            if etype in (q.kCGEventKeyDown, q.kCGEventKeyUp):
+            if etype == q.kCGEventKeyDown:
                 self._bump("tap_keys")
-                repeat = q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventAutorepeat)
-                if repeat:
+                vk = q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventKeycode)
+                hid = _mac_vk_to_hid(vk)
+                if hid is not None:
+                    self._bump("hid_mapped")
+                    engine.on_local_key(hid, True)
+                else:
+                    self._bump("hid_unmapped")
+            elif etype == q.kCGEventKeyUp:
+                self._bump("tap_keys")
+                if q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventAutorepeat):
                     return
                 vk = q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventKeycode)
                 hid = _mac_vk_to_hid(vk)
                 if hid is not None:
                     self._bump("hid_mapped")
-                    engine.on_local_key(hid, etype == q.kCGEventKeyDown)
+                    engine.on_local_key(hid, False)
                 else:
                     self._bump("hid_unmapped")
             elif etype == q.kCGEventFlagsChanged:
@@ -331,16 +339,24 @@ class MacInputPlatform:
         if user == SENTINEL or (pid and pid == os.getpid()):
             return
         try:
-            if etype in (q.kCGEventKeyDown, q.kCGEventKeyUp):
+            if etype == q.kCGEventKeyDown:
                 self._bump("tap_keys")
-                repeat = q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventAutorepeat)
-                if repeat:
-                    return  # the peer auto-repeats
                 vk = q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventKeycode)
                 hid = _mac_vk_to_hid(vk)
                 if hid is not None:
                     self._bump("hid_mapped")
-                    engine.on_local_key(hid, etype == q.kCGEventKeyDown)
+                    engine.on_local_key(hid, True)
+                else:
+                    self._bump("hid_unmapped")
+            elif etype == q.kCGEventKeyUp:
+                self._bump("tap_keys")
+                if q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventAutorepeat):
+                    return
+                vk = q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventKeycode)
+                hid = _mac_vk_to_hid(vk)
+                if hid is not None:
+                    self._bump("hid_mapped")
+                    engine.on_local_key(hid, False)
                 else:
                     self._bump("hid_unmapped")
             elif etype == q.kCGEventFlagsChanged:

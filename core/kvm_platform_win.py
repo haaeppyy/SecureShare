@@ -429,8 +429,22 @@ class WindowsInputPlatform:
     # -- injection -----------------------------------------------------------------
 
     def inject_move_rel(self, dx: int, dy: int) -> None:
-        x, y = self.cursor_position()
-        self.inject_move_abs(x + dx, y + dy)
+        if not dx and not dy:
+            return
+        _send_input(
+            [
+                INPUT(
+                    type=INPUT_MOUSE,
+                    mi=MOUSEINPUT(
+                        dx=dx,
+                        dy=dy,
+                        mouseData=0,
+                        dwFlags=MOUSEEVENTF_MOVE,
+                        dwExtraInfo=SENTINEL,
+                    ),
+                )
+            ]
+        )
 
     def inject_move_abs(self, x: int, y: int) -> None:
         self.warp_cursor(x, y)

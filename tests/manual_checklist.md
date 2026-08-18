@@ -177,6 +177,38 @@ diagnostics), plus edge latches (`blocked_edges`) and transition reasons.
       takeover, and repeated deliberate edge handoffs all still behave as
       in section 9.
 
+## 9c. KVM regression check — held keys, jitter, reverse direction
+
+F6 diagnostics now expose `handoffs` (id/role/stage per peer),
+`denial_latch`, `last_request` / `last_revert` and the `request_log` /
+`revert_log` rings (16 entries each). Request decisions: `accepted`,
+`rejected reason=denied|topology|busy|unavailable|closed`,
+`ignored reason=denial_latch|duplicate`. Reverts record `accepted` on
+wire-match, then `completed` once both sides are local.
+
+- [ ] Held keys repeat (Regression 1): Mac controls Windows, hold
+      Backspace → characters delete repeatedly (Windows does not
+      auto-repeat SendInput, the Mac forwards autorepeat events now).
+- [ ] No jitter / no handback under a sustained stream (Regression 2):
+      Mac controls Windows and moves the mouse continuously for ~30 s →
+      the Windows cursor is smooth, no flicker, no "Control returned"
+      toast; Windows' `reverts_sent` stays 0 and `request_log` shows no
+      new request mid-stream.
+- [ ] Windows physical reclaim: while Mac controls Windows, move the
+      Windows mouse → both become local, `revert_log` shows
+      `accepted` then `completed state=local` on the Mac.
+- [ ] Reverse direction (Regression 3): with the Windows cursor away
+      from its edge, cross Windows' seam once → Windows controls the
+      Mac; Mac's `last_request` decision is `accepted` even while its
+      former-controller edge latch is set (`blocked_edges` non-empty).
+      If it fails, read `last_request` / `request_log` on the Mac:
+      `rejected reason=denied` (consent off) vs `topology` (seam
+      mismatch) vs `busy` (stuck active handoff) vs `unavailable` /
+      `closed` (no platform / channel) vs nothing at all (Windows never
+      sent: check Windows' own `last_request` for `busy`/`denied`).
+- [ ] Regression: escape chord, channel loss, and repeated deliberate
+      edge handoffs still behave as in section 9.
+
 ## 10. Keyboard & mouse sharing (KVM) — Windows
 
 The Windows platform (`kvm_platform_win.py`, scan-code injection,

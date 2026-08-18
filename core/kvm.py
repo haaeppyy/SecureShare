@@ -564,6 +564,12 @@ class KVMEngine:
         self.modifier_mask = 0  # modifiers I injected (remote side)
         self._local_mask = 0  # modifiers physically held here (controller side)
         self._local_pressed: set[int] = set()  # non-modifier HID keys held here
+        # Structured handoff diagnostics (F6): control-request decisions and
+        # revert accept/completion records. Never toasted per event.
+        self._request_log: collections.deque = collections.deque(maxlen=16)
+        self._last_request: dict | None = None
+        self._revert_log: collections.deque = collections.deque(maxlen=16)
+        self._last_revert: dict | None = None
 
     def _bump_stat(self, name: str, amount: int = 1) -> None:
         with self._stats_lock:
@@ -589,6 +595,22 @@ class KVMEngine:
             )
         )
 
+    def _note_request(self, hid: int, state: str, decision: str, reason: str = None) -> None:
+        rec = {
+            "t": time.monotonic(),
+            "id": hid,
+            "state": state,
+            "decision": decision,
+            "reason": reason,
+        }
+        self._request_log.append(rec)
+        self._last_request = rec
+
+    def _note_revert(self, hid: int, phase: str, state: str) -> None:
+        rec = {"t": time.monotonic(), "id": hid, "phase": phase, "state": state}
+        self._revert_log.append(rec)
+        self._last_revert = rec
+
     def recent_transitions(self) -> list:
         return list(self._transition_log)
 
@@ -613,7 +635,20 @@ class KVMEngine:
                 len(ch._ctrlq) + len(ch._dataq) for ch in self._channels.values()
             )
             out["state"] = dict(self._state)
+            out["handoffs"] = {
+                fp: {
+                    "id": r.get("id"),
+                    "role": r.get("role"),
+                    "stage": r.get("stage"),
+                }
+                for fp, r in self._handoffs.items()
+            }
             out["blocked_edges"] = dict(self._blocked_edge)
+            out["denial_latch"] = dict(self._denial_latch)
+            out["last_request"] = self._last_request
+            out["last_revert"] = self._last_revert
+            out["request_log"] = list(self._request_log)
+            out["revert_log"] = list(self._revert_log)
             out["transitions"] = list(self._transition_log)
         if self.platform is not None:
             try:
@@ -1408,23 +1443,27 @@ class KVMEngine:
         except ProtocolError:
             return
         fp = channel.peer_fp
+        state = self._state.get(fp, STATE_LOCAL)
         rec = self._handoffs.get(fp)
         if rec is not None and rec["id"] == hid:
+            self._note_request(hid, state, "ignored", "duplicate")
             return  # duplicate of the in-flight attempt
         if fp in self._denial_latch:
             # The pointer is still on the rejected edge; stay silent
             # until the controller cancels / leaves the edge.
+            self._note_request(hid, state, "ignored", "denial_latch")
             return
         peer = self.store.get_peer(fp)
         if peer is None or not peer.get("kvm_allowed", False):
             self._denial_latch[fp] = "denied"
             self._refuse(channel, hid, "denied", f"{channel.peer_name} is not allowed to take control")
+            self._note_request(hid, state, "rejected", "denied")
             return
         if not self._topology_ok.get(fp, True):
             self._denial_latch[fp] = "topology"
             self._refuse(channel, hid, "topology")
+            self._note_request(hid, state, "rejected", "topology")
             return
-        state = self._state.get(fp, STATE_LOCAL)
         if state != STATE_LOCAL:
             # One active control at a time. Simultaneous takeover: the
             # higher fingerprint wins (deterministic tiebreak). The
@@ -1434,14 +1473,18 @@ class KVMEngine:
                 self._cancel_outbound(fp, "withdrawn")
             else:
                 self._refuse(channel, hid, "busy", f"{channel.peer_name} is busy")
+                self._note_request(hid, state, "rejected", "busy")
                 return
         if self.platform is None:
             self._refuse(channel, hid, "unavailable")
+            self._note_request(hid, state, "rejected", "unavailable")
             return
         if channel.closed:
+            self._note_request(hid, state, "rejected", "closed")
             return
         if any(s != STATE_LOCAL for s in self._state.values()):
             self._refuse(channel, hid, "busy", f"{channel.peer_name} is busy")
+            self._note_request(hid, state, "rejected", "busy")
             return
         self._handoffs[fp] = {
             "id": hid,
@@ -1455,6 +1498,7 @@ class KVMEngine:
         }
         self._state[fp] = STATE_REMOTE_PREPARING
         self._log_transition(fp, STATE_REMOTE_PREPARING, "waiting_begin", hid)
+        self._note_request(hid, state, "accepted")
         channel.send_event(KIND_CONTROL_READY, encode_handoff_id(hid))
 
     def _refuse(self, channel: KvmChannel, hid: int, reason: str, message: str = "") -> None:
@@ -1498,22 +1542,9 @@ class KVMEngine:
         fp = channel.peer_fp
         rec = self._handoffs.get(fp)
         if rec is None or rec["id"] != hid:
-            try:
-                self.on_status(
-                    f"KVM DEBUG: revert id={hid} rejected as stale, rec={rec}",
-                    level="error",
-                )
-            except Exception:
-                pass
             return  # stale
-        try:
-            self.on_status(
-                f"KVM DEBUG: revert id={hid} accepted, state={self._state.get(fp)}",
-                level="error",
-            )
-        except Exception:
-            pass
         state = self._state.get(fp, STATE_LOCAL)
+        self._note_revert(hid, "accepted", state)
         reason = reason or "peer"
         if state in (STATE_REMOTE, STATE_REMOTE_PREPARING):
             self._revert_remote(channel, f"{reason}")
@@ -1567,6 +1598,7 @@ class KVMEngine:
         channel.send_event(KIND_ALL_KEYS_UP)
         self._state[fp] = STATE_LOCAL
         self._log_transition(fp, STATE_LOCAL, None, hid, combined)
+        self._note_revert(hid, "completed", STATE_LOCAL)
         suffix = f" ({origin}, {reason})" if origin else f" ({reason})"
         self.on_status(f"Control returned from {channel.peer_name}{suffix}")
 
@@ -1587,6 +1619,7 @@ class KVMEngine:
         self._release_all_keys()
         self._state[fp] = STATE_LOCAL
         self._log_transition(fp, STATE_LOCAL, None, hid, combined)
+        self._note_revert(hid, "completed", STATE_LOCAL)
         suffix = f" ({origin}, {reason})" if origin else f" ({reason})"
         self.on_status(f"{channel.peer_name} released control{suffix}")
 
