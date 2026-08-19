@@ -352,6 +352,8 @@ class _QuartzForTap:
     kCGEventSourceUnixProcessID = 43
     kCGKeyboardEventAutorepeat = 8
     kCGKeyboardEventKeycode = 9
+    kCGMouseEventDeltaX = 20
+    kCGMouseEventDeltaY = 21
 
     def __init__(self):
         self.retained = []
@@ -359,6 +361,19 @@ class _QuartzForTap:
 
     def CGEventGetIntegerValueField(self, event, field):
         return event.get(field, 0)
+
+    def CGEventSetIntegerValueField(self, event, field, value):
+        event[field] = value
+
+    def CGEventGetLocation(self, event):
+        x, y = event.get("loc", (0.0, 0.0))
+        return type("CGPoint", (), {"x": x, "y": y})()
+
+    def CGEventSetLocation(self, event, point):
+        if hasattr(point, "x"):
+            event["loc"] = (point.x, point.y)
+        else:
+            event["loc"] = (point[0], point[1])
 
     def CGEventRetain(self, event):
         self.retained.append(event)
@@ -400,31 +415,42 @@ def test_tap_callback_enqueues_and_worker_forwards(monkeypatch):
     assert quartz.released == [event], "worker must release the retained event"
 
 
-def test_queue_overflow_drops_motion_never_keys(monkeypatch):
+def test_queue_overflow_merges_motion_never_drops_keys(monkeypatch):
+    quartz = _QuartzForTap()
+    monkeypatch.setattr(mac, "Quartz", quartz)
     monkeypatch.setattr(mac, "_QUARTZ_OK", True)
     platform = mac.MacInputPlatform()
+    dx, dy = quartz.kCGMouseEventDeltaX, quartz.kCGMouseEventDeltaY
     platform._input_queue.extend(
-        ("local", mac.Quartz.kCGEventMouseMoved, {"m": i}) for i in range(mac._TAP_QUEUE_MAX)
+        ("local", quartz.kCGEventMouseMoved, {dx: 5, dy: 3}) for _ in range(mac._TAP_QUEUE_MAX)
     )
     assert len(platform._input_queue) == mac._TAP_QUEUE_MAX
 
     # a new key-down evicts the oldest motion record
-    key = ("local", mac.Quartz.kCGEventKeyDown, {"key": 1})
+    key = ("local", quartz.kCGEventKeyDown, {"key": 1})
     platform._handle_queue_overflow(key)
     assert len(platform._input_queue) == mac._TAP_QUEUE_MAX
     assert platform._input_queue[-1] == key
     assert platform._stats["queue_dropped_motion"] == 1
     assert platform._stats["queue_dropped_critical"] == 0
 
-    # new motion while full is dropped outright
-    platform._handle_queue_overflow(("local", mac.Quartz.kCGEventMouseMoved, {"m": 999}))
+    # new motion while full merges into the last queued motion record:
+    # deltas sum exactly, the event is released, nothing is dropped
+    before = platform._stats["queue_dropped_motion"]
+    overflow = {dx: 7, dy: 1}
+    platform._handle_queue_overflow(("local", quartz.kCGEventMouseMoved, overflow))
     assert platform._input_queue[-1] == key, "the critical record must survive"
-    assert platform._stats["queue_dropped_motion"] == 2
+    assert len(platform._input_queue) == mac._TAP_QUEUE_MAX
+    merged = platform._input_queue[-2][2]
+    assert merged[dx] == 12 and merged[dy] == 4, merged
+    assert overflow in quartz.released, "the overflow event must be released"
+    assert platform._stats["queue_merged_motion"] == 1
+    assert platform._stats["queue_dropped_motion"] == before, "motion must never drop"
 
     # a queue of only critical records drops the oldest critical
     platform._input_queue.clear()
-    platform._input_queue.extend(("local", mac.Quartz.kCGEventKeyDown, {"key": i}) for i in range(mac._TAP_QUEUE_MAX))
-    platform._handle_queue_overflow(("local", mac.Quartz.kCGEventKeyUp, {"key": 99}))
+    platform._input_queue.extend(("local", quartz.kCGEventKeyDown, {"key": i}) for i in range(mac._TAP_QUEUE_MAX))
+    platform._handle_queue_overflow(("local", quartz.kCGEventKeyUp, {"key": 99}))
     assert len(platform._input_queue) == mac._TAP_QUEUE_MAX
     assert platform._input_queue[-1][2]["key"] == 99
     assert platform._stats["queue_dropped_critical"] == 1

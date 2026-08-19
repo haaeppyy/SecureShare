@@ -601,10 +601,11 @@ class KVMEngine:
         self.keepalive_interval = KEEPALIVE_INTERVAL
         self.handoff_timeout = HANDOFF_TIMEOUT
         self.lease_seconds = LEASE_SECONDS
-        # Stage 1: control is explicit (ownership shortcut + lease). The
-        # screen-edge seam handoff stays implemented but is disabled until
-        # explicit control is proven reliable (the review's Stage 2/3).
-        self.edge_handoff_enabled = False
+        # Edge-seam handoff is the primary takeover (mouse reaches the
+        # neighbor's edge -> control jumps), matching the classic shared-
+        # mouse experience. The ownership chord and the per-device menu
+        # remain as explicit alternatives.
+        self.edge_handoff_enabled = True
         self._channels: dict[str, KvmChannel] = {}
         # Unauthenticated opening connections: admitted only after the
         # first binary frame decrypts (key confirmation). A pending entry

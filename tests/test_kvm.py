@@ -8,12 +8,13 @@ The control flow is an acknowledged handoff, never a direct takeover:
 Local input is suppressed only after CONTROL_ACTIVE: the controller's
 platform delegation stays "local" until the remote confirmed.
 
-Ownership policy (Stage 1): control is explicit.  The Ctrl+Alt+Space chord
-both requests control (when idle) and releases it (when active); physical
-input on the controlled device NEVER hands control back - only the chord,
-the lease (6 s without renewal), or a disconnect does.  Edge-seam handoff
-machinery still exists behind ``edge_handoff_enabled`` and tests that
-exercise the seam set it explicitly.
+Ownership policy: the edge-seam handoff is the primary takeover (the
+cursor crosses the shared edge and control jumps), re-enabled by default
+after the explicit-ownership stage. The Ctrl+Alt+Space chord and the
+per-device menu both request control (when idle) and release it (when
+active); physical input on the controlled device NEVER hands control
+back - only the chord, the menu, the lease (6 s without renewal), or a
+disconnect does.
 """
 
 import base64
@@ -1738,3 +1739,18 @@ def test_chord_fires_with_right_option(node_pair_ctx):
         plat_a.release(hid)
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "controlling")
     assert ok, "handoff did not complete"
+
+def test_edge_seam_handoff_is_default(node_pair_ctx):
+    """Crossing the shared edge must take control with no chord and no
+    explicit flag: the seam handoff is the default takeover again."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    assert pair.a.kvm.edge_handoff_enabled is True
+    plat_a.move(740, 0)  # to the right edge of A's 1440x900 screen
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting")
+    assert ok, "edge crossing never requested control"
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "controlling")
+    assert ok, "edge crossing never completed the handoff"
+    ok = wait_for(lambda: pair.b.kvm._state.get(pair.a.store.fingerprint()) == "remote")
+    assert ok, "B never entered remote"

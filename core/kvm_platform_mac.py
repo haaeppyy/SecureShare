@@ -19,8 +19,10 @@ callback does with each event:
 The Quartz callback must return quickly or macOS disables the tap. It
 therefore only reads cheap fields, retains the event, and appends a
 compact record to a bounded queue drained by a worker thread. The
-overflow policy drops or evicts mouse-motion records; key/button
-transitions are never dropped, so a stuck modifier is impossible.
+overflow policy merges overflowed mouse motion into the last queued
+motion record (relative deltas sum exactly, so no movement is lost)
+and evicts motion to make room for key/button transitions, which are
+never dropped, so a stuck modifier is impossible.
 
 Injected events carry a kCGEventSourceUserData sentinel; the tap drops
 anything marked like that, so input never echoes. Only the sentinel is
@@ -54,7 +56,9 @@ from .kvm_geometry import Monitor, ScreenLayout, in_jump_zone
 SENTINEL = 0x5E4C0DE5
 
 # Max records waiting for the worker. The tap callback must never block,
-# so when this is full the overflow policy drops motion (never keys).
+# so when this is full the overflow policy merges motion into the last
+# queued motion record (never drops it) and only evicts motion to make
+# room for key/button transitions.
 _TAP_QUEUE_MAX = 512
 
 try:
@@ -139,6 +143,7 @@ class MacInputPlatform:
             "assoc_true": 0,
             "assoc_errors": 0,
             "queue_dropped_motion": 0,
+            "queue_merged_motion": 0,
             "queue_dropped_critical": 0,
             "worker_exceptions": 0,
         }
@@ -384,17 +389,19 @@ class MacInputPlatform:
                 pass
 
     def _handle_queue_overflow(self, record) -> None:
-        """Bounded-queue overflow: never drop key/button transitions.
-
-        A full queue drops new motion outright; when the new record is a
-        key/button (critical), the oldest motion record is evicted to make
-        room. Only if the queue holds nothing but critical records is the
-        oldest one dropped (extreme overload; the tap is failing anyway).
+        """Bounded-queue overflow: never drop key/button transitions, and
+        never drop motion - overflowed motion folds into the last queued
+        motion record, so no movement is lost (relative deltas sum
+        exactly; the drained event moves the cursor by the combined
+        distance). A full queue with no motion at all drops new motion
+        outright; when the new record is a key/button (critical), the
+        oldest motion record is evicted to make room. Only if the queue
+        holds nothing but critical records is the oldest one dropped
+        (extreme overload; the tap is failing anyway).
         """
         mode, etype, event = record
         if self._is_motion(etype):
-            self._bump("queue_dropped_motion")
-            self._release_event(event)
+            self._merge_motion(record)
             return
         with self._queue_cv:
             for i, (m, et, ev) in enumerate(self._input_queue):
@@ -414,6 +421,31 @@ class MacInputPlatform:
             else:
                 self._input_queue.append(record)
                 self._queue_cv.notify()
+
+    def _merge_motion(self, record) -> None:
+        """Fold an overflowed motion event into the last queued motion
+        event (rewriting its delta/location fields in place) so the
+        worker processes one record carrying the combined movement."""
+        q = _q()
+        mode, etype, event = record
+        dx = q.CGEventGetIntegerValueField(event, q.kCGMouseEventDeltaX)
+        dy = q.CGEventGetIntegerValueField(event, q.kCGMouseEventDeltaY)
+        with self._queue_cv:
+            for i in range(len(self._input_queue) - 1, -1, -1):
+                m, et, ev = self._input_queue[i]
+                if self._is_motion(et):
+                    odx = q.CGEventGetIntegerValueField(ev, q.kCGMouseEventDeltaX)
+                    ody = q.CGEventGetIntegerValueField(ev, q.kCGMouseEventDeltaY)
+                    q.CGEventSetIntegerValueField(ev, q.kCGMouseEventDeltaX, odx + dx)
+                    q.CGEventSetIntegerValueField(ev, q.kCGMouseEventDeltaY, ody + dy)
+                    old = q.CGEventGetLocation(ev)
+                    q.CGEventSetLocation(ev, (old.x + dx, old.y + dy))
+                    self._bump("queue_merged_motion")
+                    self._release_event(event)
+                    return
+        # No queued motion to merge into: drop (extreme overload).
+        self._bump("queue_dropped_motion")
+        self._release_event(event)
 
     def _drain_queue(self) -> None:
         with self._queue_cv:
