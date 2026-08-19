@@ -89,6 +89,7 @@ from .kvm_events import (
     decode_rel,
     decode_screen_info,
     decode_wheel,
+    encode_all_keys_up,
     encode_button,
     encode_control_request,
     encode_handoff_id,
@@ -98,7 +99,8 @@ from .kvm_events import (
     encode_rel,
     encode_screen_info,
     encode_wheel,
-    unpack_event,
+    pack_frame,
+    unpack_frame,
 )
 from .kvm_geometry import (
     GeometryError,
@@ -115,7 +117,7 @@ from .kvm_geometry import (
 from .kvm_keymap import hid_is_modifier, modifier_hids_for_mask
 from .transfer import ProtocolError, recv_frame, send_frame
 
-KVM_PROTOCOL_VERSION = 1
+KVM_PROTOCOL_VERSION = 2
 RECONNECT_INTERVAL = 5.0
 CHANNEL_READ_TIMEOUT = 2.0
 STALL_TIMEOUT = 6.0
@@ -123,6 +125,11 @@ KEEPALIVE_INTERVAL = 2.0
 HANDOFF_TIMEOUT = 1.5
 HANDSHAKE_TIMEOUT = 5.0
 MAX_FRAME = 1 << 20
+# Target-side lease: the controlled machine grants control for this long
+# and any inbound frame from the controller (PINGs flow every 2 s) refreshes
+# it. When renewals stop, the target returns to local control on its own -
+# it never waits for a final "release" message that may be lost.
+LEASE_SECONDS = 6.0
 # After the controlled device takes control back, the former controller's
 # edge stays latched for this long (position-independent): residual motion
 # right after the revert cannot re-acquire control, but a deliberate move
@@ -185,6 +192,22 @@ STATE_CONTROLLING = "controlling"
 STATE_REMOTE_PREPARING = "remote_preparing"
 STATE_REMOTE = "remote"
 STATE_REVERTING = "reverting"
+
+# Frame kinds whose delivery is tied to the active handoff and to a
+# monotonic per-channel sequence number (replay/ordering protection).
+# Everything else (control, health, screen info) validates its own
+# freshness via handoff ids in the body.
+INPUT_KINDS = frozenset(
+    {
+        KIND_MOUSE_MOVE_REL,
+        KIND_MOUSE_MOVE_ABS,
+        KIND_MOUSE_BUTTON,
+        KIND_MOUSE_WHEEL,
+        KIND_KEY_DOWN,
+        KIND_KEY_UP,
+        KIND_MODIFIERS,
+    }
+)
 
 # Link states (per peer): mDNS discovery alone is never readiness.
 LINK_OFFLINE = "offline"
@@ -322,6 +345,8 @@ class KvmChannel:
         self._engine_removed = False
         self._outbound = 0
         self._inbound = inbound_start  # responder pre-consumes frame 0 (key confirmation)
+        self._out_seq = 0  # per-direction sequence for outgoing frames
+        self._last_seq_in = -1  # highest accepted inbound sequence
         self.last_inbound = time.monotonic()
         self._last_ping = 0.0
         # Outbound writer: the event tap / hook callbacks must never block
@@ -358,27 +383,36 @@ class KvmChannel:
             KIND_SCREEN_INFO,
         )
 
-    def send_event(self, kind: int, body: bytes = b"") -> bool:
+    def send_event(self, kind: int, body: bytes = b"", hid: int = 0) -> bool:
         """Queue one event for the writer thread. True means the frame was
         accepted; False means the channel is already closed. Send failures
-        surface in the writer (forced teardown), never silently here."""
+        surface in the writer (forced teardown), never silently here.
+
+        ``hid`` is the handoff_id the frame belongs to: input frames carry
+        the active handoff so the receiver can reject stale ones; control
+        frames pass 0 (their bodies carry their own ids).
+        """
         with self._lock:
             if self.closed or self._outbound >= COUNTER_LIMIT:
                 return False
         with self._sendcv:
             if self._is_priority(kind):
-                self._ctrlq.append((kind, body))
+                self._ctrlq.append((kind, body, hid))
             elif kind == KIND_MOUSE_MOVE_REL and self._dataq and self._dataq[-1][0] == "rel":
                 # Coalesce consecutive relative motion into one frame.
-                _, dx, dy = self._dataq[-1]
-                ndx, ndy = struct.unpack(">hh", body)
-                self._dataq[-1] = ("rel", dx + ndx, dy + ndy)
+                _, dx, dy, prev_hid = self._dataq[-1]
+                if prev_hid == hid:
+                    ndx, ndy = struct.unpack(">hh", body)
+                    self._dataq[-1] = ("rel", dx + ndx, dy + ndy, hid)
+                else:
+                    ndx, ndy = struct.unpack(">hh", body)
+                    self._dataq.append(("rel", ndx, ndy, hid))
             else:
                 if kind == KIND_MOUSE_MOVE_REL:
                     ndx, ndy = struct.unpack(">hh", body)
-                    self._dataq.append(("rel", ndx, ndy))
+                    self._dataq.append(("rel", ndx, ndy, hid))
                 else:
-                    self._dataq.append((kind, body))
+                    self._dataq.append((kind, body, hid))
             self._sendcv.notify()
         self._engine._bump_stat("queued_frames")
         return True
@@ -396,9 +430,9 @@ class KvmChannel:
                     continue
             try:
                 if item[0] == "rel":
-                    self._flush_rel(item[1], item[2])
+                    self._flush_rel(item[1], item[2], item[3])
                 else:
-                    self._flush_locked(item[0], item[1])
+                    self._flush_locked(item[0], item[1], item[2])
             except Exception:
                 # No writer failure may strand the session: anything
                 # unexpected still tears the channel down.
@@ -416,7 +450,7 @@ class KvmChannel:
             if self.closed:
                 break
 
-    def _flush_rel(self, dx: int, dy: int) -> None:
+    def _flush_rel(self, dx: int, dy: int, hid: int) -> None:
         """Send relative motion, splitting deltas that overflow the signed
         16-bit wire format. A blocked network writer can coalesce an
         arbitrary amount of motion into one queue entry; without the split
@@ -425,14 +459,14 @@ class KvmChannel:
         while dx or dy:
             cdx = max(-32767, min(32767, dx))
             cdy = max(-32767, min(32767, dy))
-            self._flush_locked(KIND_MOUSE_MOVE_REL, struct.pack(">hh", cdx, cdy))
+            self._flush_locked(KIND_MOUSE_MOVE_REL, struct.pack(">hh", cdx, cdy), hid)
             dx -= cdx
             dy -= cdy
             if self.closed:
                 return
 
-    def _flush_locked(self, kind: int, body: bytes) -> None:
-        plain = bytes([kind]) + body
+    def _flush_locked(self, kind: int, body: bytes, hid: int = 0) -> None:
+        plain = pack_frame(hid, self._out_seq, kind, body)
         failed = False
         with self._lock:
             if self.closed:
@@ -442,6 +476,7 @@ class KvmChannel:
             try:
                 self.conn.sendall(struct.pack(">I", len(ct)) + ct)
                 self._outbound += 1
+                self._out_seq += 1
             except OSError:
                 # A dead socket must tear the channel down so the peer's
                 # per-peer state cannot stay frozen at "controlling".
@@ -500,9 +535,21 @@ class KvmChannel:
             self._inbound += 1
             self.last_inbound = time.monotonic()
             try:
-                kind, body = unpack_event(plain)
+                hid, seq, kind, body = unpack_frame(plain)
             except ProtocolError:
                 break
+            if kind in INPUT_KINDS:
+                # Replay/ordering guard: per-direction monotonic sequence.
+                # Frames from an earlier handoff carry smaller sequences and
+                # are dropped here; the engine additionally rejects input
+                # whose handoff_id is not the live one.
+                if seq <= self._last_seq_in:
+                    self._engine._bump_stat("replayed_frames")
+                    continue
+                self._last_seq_in = seq
+            # Any inbound frame from the controller refreshes the
+            # target-side lease; the watchdog enforces the deadline.
+            self._engine.touch_lease(self, kind)
             try:
                 self._engine.handle_event(self, kind, body)
             except Exception as exc:
@@ -552,6 +599,11 @@ class KVMEngine:
         self.stall_timeout = STALL_TIMEOUT
         self.keepalive_interval = KEEPALIVE_INTERVAL
         self.handoff_timeout = HANDOFF_TIMEOUT
+        self.lease_seconds = LEASE_SECONDS
+        # Stage 1: control is explicit (ownership shortcut + lease). The
+        # screen-edge seam handoff stays implemented but is disabled until
+        # explicit control is proven reliable (the review's Stage 2/3).
+        self.edge_handoff_enabled = False
         self._channels: dict[str, KvmChannel] = {}
         # Unauthenticated opening connections: admitted only after the
         # first binary frame decrypts (key confirmation). A pending entry
@@ -594,6 +646,8 @@ class KVMEngine:
             "queued_frames": 0,
             "reverts_sent": 0,
             "send_failures": 0,
+            "replayed_frames": 0,
+            "lease_expiries": 0,
         }
         self._stats_lock = threading.Lock()
         # Ordered state-machine history for debugging (F3).
@@ -604,6 +658,7 @@ class KVMEngine:
         self._active_since = None  # F7: monotonic time the current session went active
         self.pressed: set[int] = set()  # HID keys I injected (remote side)
         self.modifier_mask = 0  # modifiers I injected (remote side)
+        self._buttons_injected: set[int] = set()  # mouse buttons I injected
         self._local_mask = 0  # modifiers physically held here (controller side)
         self._local_pressed: set[int] = set()  # non-modifier HID keys held here
         # Structured handoff diagnostics (F6): control-request decisions and
@@ -842,7 +897,8 @@ class KVMEngine:
             raw = recv_frame(conn)
             nonce = crypto.chunk_nonce(peer_nonce8, 0)
             plain = crypto.decrypt_with_nonce(key, nonce, raw)
-            confirmed_kind, confirmed_body = unpack_event(plain)
+            confirmed_hid, confirmed_seq, confirmed_kind, confirmed_body = unpack_frame(plain)
+            del confirmed_hid, confirmed_seq
         except (OSError, ProtocolError, ValueError, InvalidTag):
             try:
                 send_frame(conn, {"type": "error", "code": "kvm_auth_failed"})
@@ -1006,6 +1062,23 @@ class KVMEngine:
 
     # -- watchdog: handoff deadlines ------------------------------------------
 
+    def touch_lease(self, channel: KvmChannel, kind: int) -> None:
+        """Refresh the target-side lease and the controller-side peer
+        freshness when the controller's frames keep arriving. Only a live
+        handoff is refreshed; a stale channel cannot keep a session alive.
+        """
+        fp = channel.peer_fp
+        if channel.closed:
+            return
+        with self._lock:
+            rec = self._handoffs.get(fp)
+            if rec is None:
+                return
+            now = time.monotonic()
+            rec["peer_last_seen"] = now
+            if rec.get("role") == "target" and rec.get("stage") in ("active",):
+                rec["lease_deadline"] = now + self.lease_seconds
+
     def _watchdog_loop(self) -> None:
         while not self._stop.is_set():
             self._stop.wait(0.2)
@@ -1017,8 +1090,43 @@ class KVMEngine:
                     deadline = rec[1].get("deadline")
                     if deadline and now >= deadline:
                         self._expire_handoff(rec[0], rec[1])
+                        continue
+                    lease = rec[1].get("lease_deadline")
+                    if lease and now >= lease:
+                        self._expire_lease(rec[0], rec[1])
+                        continue
+                    last_seen = rec[1].get("peer_last_seen")
+                    if last_seen and now - last_seen > self.lease_seconds:
+                        self._expire_peer_silence(rec[0], rec[1])
+                        continue
                 self._sweep_pending(now)
                 self._poll_keyboard_health()
+
+    def _expire_lease(self, fp: str, rec: dict) -> None:
+        """Target side: the controller stopped renewing the lease. Return
+        to local control without waiting for a release message."""
+        ch = self._channels.get(fp)
+        if ch is None or ch.closed:
+            return
+        self._bump_stat("lease_expiries")
+        self._revert_remote(ch, "lease expired")
+        self.on_status(
+            f"KVM: {ch.peer_name} stopped renewing control - local input restored"
+        )
+
+    def _expire_peer_silence(self, fp: str, rec: dict) -> None:
+        """Controller side: nothing has come back from the target for a
+        lease period (the target may have died or the link silently died).
+        Release control locally; a reconnect will resync the session."""
+        ch = self._channels.get(fp)
+        if ch is None or ch.closed:
+            return
+        self._bump_stat("lease_expiries")
+        if rec["role"] == "controller" and rec.get("stage") == "active":
+            self._revert_control(ch, "peer silent")
+            self.on_status(
+                f"KVM: no response from {ch.peer_name} - released control"
+            )
 
     def _sweep_pending(self, now: float) -> None:
         """Expire stalled opening connections; they never touch _channels."""
@@ -1105,7 +1213,11 @@ class KVMEngine:
 
     # -- platform callbacks (capture side) ------------------------------------
 
-    def on_local_mouse(self, dx: int, dy: int, x: int, y: int) -> None:
+    def observe_local_mouse(self, dx: int, dy: int, x: int, y: int) -> None:
+        """Watch-only local mouse input: seam detection, edge latches and
+        pending-request withdrawal. Never transmits anything, and on the
+        controlled device never reverts control (explicit ownership: only
+        the shortcut or the lease hands control back)."""
         if not self.enabled or self.platform is None:
             return
         with self._lock:
@@ -1130,7 +1242,18 @@ class KVMEngine:
                     self._blocked_until.pop(fp, None)
             channel = self._active_channel()
             if channel is not None:
-                self._on_active_local_mouse(channel, dx, dy, x, y, handoff_side)
+                # Active session: transmission is send_controlled_mouse's
+                # job; observe has nothing else to do here.
+                return
+            # No confirmed session. A pending request withdraws once the
+            # pointer leaves its seam. A peer we are remote to receives
+            # nothing from physical motion here (explicit ownership).
+            for fp, st in list(self._state.items()):
+                if st == STATE_REQUESTING and (
+                    handoff_side is None or handoff_side != self._my_side_for(fp)
+                ):
+                    self._cancel_outbound(fp, "edge-left")
+            if not self.edge_handoff_enabled:
                 return
             if handoff_side is None:
                 return
@@ -1151,103 +1274,67 @@ class KVMEngine:
             tx, ty = entry_point(peer_layout, handoff_side, fraction)
             self._request_control(channel, tx, ty, fraction)
 
-    def _on_active_local_mouse(self, channel, dx: int, dy: int, x: int, y: int, cursor_side) -> None:
-        fp = channel.peer_fp
-        state = self._state.get(fp, STATE_LOCAL)
-        if state == STATE_CONTROLLING:
-            rec = self._handoffs.get(fp)
-            if rec is not None and rec.get("stage") == "active":
-                channel.send_event(KIND_MOUSE_MOVE_REL, encode_rel(dx, dy))
-            return
-        if state == STATE_REQUESTING:
-            # While a handoff is pending the pointer may wander away from
-            # the edge; that withdraws the request.
-            if cursor_side is None or cursor_side != self._my_side_for(fp):
-                self._cancel_outbound(fp, "edge-left")
-            return
-        if state == STATE_REMOTE:
-            origin = f"{self._capture_origin}-pointer" if self._capture_origin else "local-pointer"
-            self.on_remote_local_input(origin=origin)
-
-    def on_remote_local_input(self, origin: str = "local-input") -> None:
-        """Release a peer's control after physical pointer input here.
-
-        The controlled device is independent again after a local mouse move,
-        click, or scroll.  In particular, injected pointer motion reaching a
-        screen edge must *not* hand control back, or the two sides repeatedly
-        bounce control as the cursor is clamped to that edge.
-        """
-        with self._lock:
-            channel = self._active_channel()
-            if channel is None:
-                return
-            fp = channel.peer_fp
-            if self._state.get(fp) != STATE_REMOTE:
-                return
-            rec = self._handoffs.get(fp)
-            if rec is None or channel.closed:
-                return
-            self._bump_stat("reverts_sent")
-            ok = channel.send_event(KIND_CONTROL_REVERT, encode_handoff_message(rec["id"], origin))
-            if not ok:
-                # The frame could not even be queued: force the session
-                # down so the peer's state cannot stay frozen.
-                try:
-                    self.on_status(
-                        f"KVM DEBUG: revert id={rec['id']} send failed - forcing teardown",
-                        level="error",
-                    )
-                except Exception:
-                    pass
-                channel.close()
-                channel.engine_remove()
-                return
-            self._revert_remote(channel, "local input", origin=origin)
-
-    def on_local_button(self, button: int, down: bool) -> None:
-        with self._lock:
-            channel = self._active_channel()
-            if channel is None:
-                return
-            fp = channel.peer_fp
-            if self._state.get(fp) == STATE_REMOTE:
-                origin = f"{self._capture_origin}-pointer" if self._capture_origin else "local-pointer"
-                self.on_remote_local_input(origin=origin)
-                return
-            rec = self._handoffs.get(fp)
-            if self._state.get(fp) != STATE_CONTROLLING or rec is None or rec.get("stage") != "active":
-                return
-            channel.send_event(KIND_MOUSE_BUTTON, encode_button(button, down))
-
-    def on_local_wheel(self, dy: int, dx: int) -> None:
-        with self._lock:
-            channel = self._active_channel()
-            if channel is None:
-                return
-            fp = channel.peer_fp
-            if self._state.get(fp) == STATE_REMOTE:
-                origin = f"{self._capture_origin}-pointer" if self._capture_origin else "local-pointer"
-                self.on_remote_local_input(origin=origin)
-                return
-            rec = self._handoffs.get(fp)
-            if self._state.get(fp) != STATE_CONTROLLING or rec is None or rec.get("stage") != "active":
-                return
-            channel.send_event(KIND_MOUSE_WHEEL, encode_wheel(dy, dx))
-
-    def on_local_key(self, hid: int, down: bool) -> None:
+    def send_controlled_mouse(self, dx: int, dy: int) -> None:
+        """Controller input: forward relative motion to the active peer,
+        tagged with the handoff id so stale frames are rejected."""
         if not self.enabled or self.platform is None:
             return
         with self._lock:
-            # A real key press on the controlled device is an explicit
-            # request to reclaim it, just like moving its physical mouse.
-            # The event that triggers the release may be swallowed by the
-            # platform; subsequent keys go to the now-local device normally.
             channel = self._active_channel()
-            if channel is not None and self._state.get(channel.peer_fp) == STATE_REMOTE:
-                if down:
-                    origin = f"{self._capture_origin}-key" if self._capture_origin else "local-key"
-                    self.on_remote_local_input(origin=origin)
+            if channel is None:
                 return
+            fp = channel.peer_fp
+            rec = self._handoffs.get(fp)
+            if self._state.get(fp) != STATE_CONTROLLING or rec is None or rec.get("stage") != "active":
+                return
+            channel.send_event(KIND_MOUSE_MOVE_REL, encode_rel(dx, dy), hid=rec["id"])
+
+    def observe_local_button(self, button: int, down: bool) -> None:
+        """Watch-only local buttons. Observation has nothing to do with
+        buttons (the seam runs on motion), so this is a documented no-op;
+        controlling-mode buttons use send_controlled_button."""
+
+    def send_controlled_button(self, button: int, down: bool) -> None:
+        """Controller input: forward a button transition to the active peer."""
+        if not self.enabled or self.platform is None:
+            return
+        with self._lock:
+            channel = self._active_channel()
+            if channel is None:
+                return
+            fp = channel.peer_fp
+            rec = self._handoffs.get(fp)
+            if self._state.get(fp) != STATE_CONTROLLING or rec is None or rec.get("stage") != "active":
+                return
+            channel.send_event(KIND_MOUSE_BUTTON, encode_button(button, down), hid=rec["id"])
+
+    def observe_local_wheel(self, dy: int, dx: int) -> None:
+        """Watch-only local wheel. Observation has nothing to do with the
+        wheel (the seam runs on motion), so this is a documented no-op;
+        controlling-mode wheel uses send_controlled_wheel."""
+
+    def send_controlled_wheel(self, dy: int, dx: int) -> None:
+        """Controller input: forward a wheel step to the active peer."""
+        if not self.enabled or self.platform is None:
+            return
+        with self._lock:
+            channel = self._active_channel()
+            if channel is None:
+                return
+            fp = channel.peer_fp
+            rec = self._handoffs.get(fp)
+            if self._state.get(fp) != STATE_CONTROLLING or rec is None or rec.get("stage") != "active":
+                return
+            channel.send_event(KIND_MOUSE_WHEEL, encode_wheel(dy, dx), hid=rec["id"])
+
+    def observe_local_key(self, hid: int, down: bool) -> None:
+        """Watch-only local keys: ownership-chord arming. Never transmits,
+        and never reverts control (explicit ownership: the platform
+        forwards physical keys to the engine only so the chord can be
+        recognized)."""
+        if not self.enabled or self.platform is None:
+            return
+        with self._lock:
             if hid_is_modifier(hid):
                 self._update_local_mask(hid, down)
             else:
@@ -1256,6 +1343,12 @@ class KVMEngine:
                 else:
                     self._local_pressed.discard(hid)
             self._check_chord()
+
+    def send_controlled_key(self, hid: int, down: bool) -> None:
+        """Controller input: forward a key transition to the active peer."""
+        if not self.enabled or self.platform is None:
+            return
+        with self._lock:
             channel = self._active_channel()
             if channel is None:
                 return
@@ -1264,9 +1357,11 @@ class KVMEngine:
             if self._state.get(fp) != STATE_CONTROLLING or rec is None or rec.get("stage") != "active":
                 return
             if hid_is_modifier(hid):
-                channel.send_event(KIND_MODIFIERS, encode_modifiers(self._local_mask))
+                channel.send_event(KIND_MODIFIERS, encode_modifiers(self._local_mask), hid=rec["id"])
             else:
-                channel.send_event(KIND_KEY_DOWN if down else KIND_KEY_UP, encode_key(hid))
+                channel.send_event(
+                    KIND_KEY_DOWN if down else KIND_KEY_UP, encode_key(hid), hid=rec["id"]
+                )
 
     def _update_local_mask(self, hid: int, down: bool) -> None:
         from .kvm_keymap import modifier_mask_for_hid
@@ -1308,31 +1403,62 @@ class KVMEngine:
             self._revert_remote(channel, "peer edge", origin="peer-edge")
 
     def on_escape_chord(self) -> None:
-        """Forced local release (Ctrl+Alt+Space / Ctrl+Option+Space)."""
+        """Ownership toggle (Ctrl+Alt+Space / Ctrl+Option+Space).
+
+        With a session, it forces local release. Without one, it requests
+        control of the single ready peer - explicit ownership replaces the
+        auto-seam handoff (review Stage 1). With several peers ready a
+        picker is required, so we refuse rather than guess.
+        """
         if not self.enabled:
             return
         with self._lock:
             channel = self._active_channel()
-            if channel is None:
+            if channel is not None:
+                fp = channel.peer_fp
+                state = self._state.get(fp, STATE_LOCAL)
+                rec = self._handoffs.get(fp)
+                if rec is None:
+                    return
+                if state in (STATE_CONTROLLING, STATE_REQUESTING, STATE_REMOTE, STATE_REMOTE_PREPARING):
+                    try:
+                        channel.send_event(KIND_CONTROL_REVERT, encode_handoff_message(rec["id"], "escape"))
+                    except Exception:
+                        pass
+                    if state in (STATE_REMOTE, STATE_REMOTE_PREPARING):
+                        self._revert_remote(channel, "escape chord", origin="escape")
+                    else:
+                        # Same protection as a peer-driven revert: the cursor is
+                        # restored just inside the seam, so latch the edge until
+                        # the pointer clearly leaves it.
+                        self._blocked_edge[fp] = self._my_side_for(fp)
+                        self._revert_control(channel, "escape chord", origin="escape")
                 return
-            fp = channel.peer_fp
-            state = self._state.get(fp, STATE_LOCAL)
-            rec = self._handoffs.get(fp)
-            if rec is None:
+            ready = [
+                ch
+                for fp, ch in self._channels.items()
+                if self._state.get(fp, STATE_LOCAL) == STATE_LOCAL and self._link_ready(fp)
+            ]
+            if not ready:
+                self.on_status("KVM: no connected peer to take control of", level="error")
                 return
-            if state in (STATE_CONTROLLING, STATE_REQUESTING, STATE_REMOTE, STATE_REMOTE_PREPARING):
-                try:
-                    channel.send_event(KIND_CONTROL_REVERT, encode_handoff_message(rec["id"], "escape"))
-                except Exception:
-                    pass
-                if state in (STATE_REMOTE, STATE_REMOTE_PREPARING):
-                    self._revert_remote(channel, "escape chord", origin="escape")
-                else:
-                    # Same protection as a peer-driven revert: the cursor is
-                    # restored just inside the seam, so latch the edge until
-                    # the pointer clearly leaves it.
-                    self._blocked_edge[fp] = self._my_side_for(fp)
-                    self._revert_control(channel, "escape chord", origin="escape")
+            if len(ready) > 1:
+                self.on_status(
+                    "KVM: several peers ready - peer selection is not implemented yet",
+                    level="error",
+                )
+                return
+            ch = ready[0]
+            layout = self._peer_layouts.get(ch.peer_fp)
+            if layout is None:
+                self.on_status(f"KVM: {ch.peer_name} has no layout yet", level="error")
+                return
+            self._request_control(
+                ch,
+                layout.left() + layout.width() // 2,
+                layout.top() + layout.height() // 2,
+                0.5,
+            )
 
     def on_display_change(self) -> None:
         if not self.enabled or self.platform is None:
@@ -1354,15 +1480,18 @@ class KVMEngine:
         if self._active_channel() is not None:
             return
         hid = self._next_handoff_id()
+        now = time.monotonic()
         self._handoffs[fp] = {
             "id": hid,
             "role": "controller",
             "stage": "waiting_ready",
-            "deadline": time.monotonic() + self.handoff_timeout,
+            "deadline": now + self.handoff_timeout,
             "entry": (tx, ty),
             "mask": self._local_mask,
             "fraction": fraction,
             "parked": False,
+            "peer_last_seen": now,
+            "lease_deadline": None,
         }
         self._last_sent_id[fp] = hid
         self._state[fp] = STATE_REQUESTING
@@ -1469,6 +1598,9 @@ class KVMEngine:
             return
         rec["stage"] = "active"
         rec["deadline"] = None
+        # Grant the lease: the controller must keep renewing it (every
+        # inbound frame, PINGs flow every ~2 s) or we reclaim this device.
+        rec["lease_deadline"] = time.monotonic() + self.lease_seconds
         self._state[fp] = STATE_REMOTE
         self._log_transition(fp, STATE_REMOTE, "active", hid)
         self._active_since = time.monotonic()
@@ -1546,6 +1678,8 @@ class KVMEngine:
             "mask": mask,
             "fraction": None,
             "parked": False,
+            "peer_last_seen": time.monotonic(),
+            "lease_deadline": None,  # granted only when the handoff goes active
         }
         self._state[fp] = STATE_REMOTE_PREPARING
         self._log_transition(fp, STATE_REMOTE_PREPARING, "waiting_begin", hid)
@@ -1643,12 +1777,20 @@ class KVMEngine:
         self._handoffs.pop(fp, None)
         self._log_transition(fp, STATE_REVERTING, None, hid, combined)
         self._active_since = None
+        # Tell the target to release injected keys *before* restoring local
+        # delegation. The frame is tagged with this session's handoff id so
+        # a release arriving after a NEWER session began is dropped (it
+        # cannot clear the newer session's keys).
+        if hid is not None:
+            try:
+                channel.send_event(KIND_ALL_KEYS_UP, encode_all_keys_up(hid))
+            except Exception:
+                pass
         if parked:
             self._restore_controller_cursor(fp, fraction)
         # Delegation failures are visible here: a stuck cursor is the exact
         # symptom the user reported, so it must not be swallowed (F2).
         self._restore_local_delegation()
-        channel.send_event(KIND_ALL_KEYS_UP)
         self._state[fp] = STATE_LOCAL
         self._log_transition(fp, STATE_LOCAL, None, hid, combined)
         self._note_revert(hid, "completed", STATE_LOCAL)
@@ -1668,6 +1810,14 @@ class KVMEngine:
         self._handoffs.pop(fp, None)
         self._log_transition(fp, STATE_REVERTING, None, hid, combined)
         self._active_since = None
+        # Same ordering as the controller side: the release frame goes out
+        # (tagged with the ending session) before local delegation is
+        # restored.
+        if hid is not None:
+            try:
+                channel.send_event(KIND_ALL_KEYS_UP, encode_all_keys_up(hid))
+            except Exception:
+                pass
         self._restore_local_delegation()
         self._release_all_keys()
         self._state[fp] = STATE_LOCAL
@@ -1675,6 +1825,28 @@ class KVMEngine:
         self._note_revert(hid, "completed", STATE_LOCAL)
         suffix = f" ({_friendly_reason(reason)})" if reason else ""
         self.on_status(f"Control taken back by {channel.peer_name}{suffix}")
+
+    def on_platform_input_lost(self) -> None:
+        """Called by the platform when its input capture died (e.g. the
+        macOS tap was disabled by macOS). The peer must not believe it
+        still owns this machine, so the active handoff is reverted and
+        the peer told."""
+        with self._lock:
+            channel = self._active_channel()
+            if channel is None:
+                return
+            fp = channel.peer_fp
+            state = self._state.get(fp, STATE_LOCAL)
+            rec = self._handoffs.get(fp)
+            if rec is not None:
+                try:
+                    channel.send_event(KIND_CONTROL_REVERT, encode_handoff_message(rec["id"], "input-lost"))
+                except Exception:
+                    pass
+            if state in (STATE_REMOTE, STATE_REMOTE_PREPARING):
+                self._revert_remote(channel, "input capture lost", origin="platform")
+            elif state in (STATE_CONTROLLING, STATE_REQUESTING):
+                self._revert_control(channel, "input capture lost")
 
     def _restore_local_delegation(self, attempts: int = 3) -> bool:
         """Force the platform back to local delegation and show the cursor.
@@ -1736,8 +1908,14 @@ class KVMEngine:
             layout = self._my_layout()
             x, y = return_point(layout, self._my_side_for(fp), fraction)
             self.platform.warp_cursor(x, y)
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                self.on_status(
+                    f"KVM: cursor restore after handback failed: {exc}",
+                    level="error",
+                )
+            except Exception:
+                pass
 
     def _sync_delegation(self, channel: KvmChannel = None) -> bool:
         """Derive the platform delegation from confirmed engine state.
@@ -1809,7 +1987,13 @@ class KVMEngine:
                 self._on_control_revert(channel, body)
                 return
             if kind == KIND_ALL_KEYS_UP:
-                self._release_all_keys()
+                # Tagged with the session being cleaned up. A release that
+                # arrives after a NEWER session began (or is replayed from
+                # a stale stream) must not clear the newer session's keys.
+                hid = decode_handoff_id(body) if len(body) == 4 else None
+                rec = self._handoffs.get(channel.peer_fp)
+                if rec is None or rec["id"] == hid:
+                    self._release_all_keys()
                 return
             if kind == KIND_SCREEN_INFO:
                 self._on_screen_info(channel, body)
@@ -1896,6 +2080,10 @@ class KVMEngine:
             elif kind == KIND_MOUSE_BUTTON:
                 button, down = decode_button(body)
                 p.inject_button(button, down)
+                if down:
+                    self._buttons_injected.add(button)
+                else:
+                    self._buttons_injected.discard(button)
             elif kind == KIND_MOUSE_WHEEL:
                 dy, dx = decode_wheel(body)
                 p.inject_wheel(dy, dx)
@@ -1942,6 +2130,12 @@ class KVMEngine:
                 except Exception:
                     pass
             self.modifier_mask = 0
+        for button in sorted(self._buttons_injected):
+            try:
+                self.platform.inject_button(button, False)
+            except Exception:
+                pass
+        self._buttons_injected.clear()
 
     def on_channel_closed(self, channel: KvmChannel) -> None:
         with self._lock:
@@ -1955,7 +2149,10 @@ class KVMEngine:
             self._denial_latch.pop(fp, None)
             self._last_sent_id.pop(fp, None)
             self._link_status.pop(fp, None)
-            if state not in (None, STATE_LOCAL):
+            if state not in (None, STATE_LOCAL, STATE_REVERTING):
+                # A channel dying mid-revert is the revert's responsibility:
+                # it already restores delegation, so restoring here too would
+                # double-restart capture on a slow platform.
                 self._restore_local_delegation(attempts=2)
                 self._release_all_keys()
                 self._log_transition(fp, STATE_LOCAL, None, None, "channel closed")
@@ -1980,8 +2177,16 @@ class KVMEngine:
         return fp in self._channels and self._link_status.get(fp) == LINK_READY
 
     def _active_channel(self) -> KvmChannel | None:
+        """The channel of the *confirmed* session: a fully active
+        controlling handoff, or a remote session. Pending requests and
+        reverts are not active - physical input must not be routed or
+        suppressed around them."""
         for fp, state in self._state.items():
-            if state != STATE_LOCAL:
+            if state == STATE_CONTROLLING:
+                rec = self._handoffs.get(fp)
+                if rec is not None and rec.get("stage") == "active":
+                    return self._channels.get(fp)
+            elif state == STATE_REMOTE:
                 return self._channels.get(fp)
         return None
 

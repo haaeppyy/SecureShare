@@ -127,6 +127,71 @@ def test_offscreen_monitor_union():
     assert in_jump_zone(s, s.right() - 1, 500) == "right"
 
 
+def test_uneven_monitors_no_phantom_seam_in_gap():
+    # left monitor is shorter: the union strip right of it (x 0..1439,
+    # y 900..1080) belongs to no monitor and is NOT a seam, even though
+    # it touches the union's right edge.
+    s = ScreenLayout([Monitor(0, 0, 1440, 900), Monitor(1440, 0, 1920, 1080)])
+    assert in_jump_zone(s, 1439, 1000) is None
+    assert clamp_to_edge(s, 1439, 1000) == (1439, 1000)
+
+
+def test_uneven_monitors_seam_only_on_real_edges():
+    s = ScreenLayout([Monitor(0, 0, 1440, 900), Monitor(1440, 0, 1920, 1080)])
+    assert in_jump_zone(s, 1439, 500) is None  # internal boundary, not a seam
+    assert in_jump_zone(s, 1439, 200) is None
+    assert in_jump_zone(s, 3359, 1000) == "right"  # taller monitor's real edge
+    assert in_jump_zone(s, 3359, 100) == "right"
+    assert in_jump_zone(s, 0, 899) == "left"
+
+
+def test_stacked_monitors_seam_per_monitor():
+    s = ScreenLayout([Monitor(0, 0, 1440, 900), Monitor(0, 900, 1920, 1080)])
+    assert in_jump_zone(s, 1919, 500) is None  # top monitor ends at x=1440
+    assert in_jump_zone(s, 1919, 1000) == "right"  # bottom monitor's real edge
+    assert in_jump_zone(s, 1439, 0) == "top"
+    assert in_jump_zone(s, 1439, 900) is None  # internal boundary row, not a seam
+    assert in_jump_zone(s, 1439, 899) is None  # inside top monitor, internal edges
+    assert in_jump_zone(s, 1919, 1979) == "right"  # corner: horizontal first
+    assert in_jump_zone(s, 2, 1000) == "left"  # bottom monitor's real left edge
+
+
+def test_beyond_union_presses_the_edge_it_exited():
+    # The OS clamps the cursor to the desktop, but a fake or a fast
+    # motion can overshoot: 1 px past the right wall is still "at" the
+    # wall, so the edge must keep being reported (and clamped back in).
+    s = layout()
+    assert in_jump_zone(s, 1441, 450) == "right"
+    assert in_jump_zone(s, 1450, 450) == "right"
+    assert clamp_to_edge(s, 1441, 450) == (1439, 450)
+    assert in_jump_zone(s, -1, 450) == "left"
+    assert clamp_to_edge(s, -3, 450) == (0, 450)
+    assert in_jump_zone(s, 700, -2) == "top"
+    assert in_jump_zone(s, 700, 901) == "bottom"
+    # past the wall always presses it (v1 behaviour: the OS clamps there)
+    assert in_jump_zone(s, 1500, 450) == "right"
+
+
+def test_seam_fraction_uses_containing_monitor():
+    # Two monitors, uneven sizes: the fraction is relative to the monitor
+    # the cursor is actually in, not the union.
+    s = ScreenLayout([Monitor(0, 0, 1440, 900), Monitor(1440, -100, 1920, 1080)])
+    # union height is 1080; bottom monitor's own height is 1080 but it
+    # starts at y=-100, so mid-monitor must map to 0.5.
+    assert seam_fraction(s, "right", 3359, 440) == pytest.approx(540 / 1079)
+    assert seam_fraction(s, "right", 3359, -100) == pytest.approx(0.0)
+    assert seam_fraction(s, "right", 3359, 979) == pytest.approx(1.0)
+    # in the short monitor, fraction uses its own height
+    assert seam_fraction(s, "right", 1439, 450) == pytest.approx(450 / 899)
+    # empty union space (right of the short monitor, y in 900..980) falls
+    # back to union bounds and clamps
+    assert seam_fraction(s, "right", 1439, 950) == pytest.approx(1050 / 1079)
+    assert seam_fraction(s, "right", 1439, 980) == pytest.approx(1.0)
+    # single monitor: identical to the union computation
+    single = layout(h=900)
+    assert seam_fraction(single, "right", 1439, 450) == seam_fraction(s, "right", 1439, 450)
+
+
 def test_scale_conversion():
     assert pt_to_px(100, 2.0) == 200
     assert px_to_pt(200, 2.0) == 100

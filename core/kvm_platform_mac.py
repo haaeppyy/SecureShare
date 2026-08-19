@@ -5,18 +5,40 @@ runs whenever the engine is started; ``set_delegation`` decides what the
 callback does with each event:
 
     local       return the original event (apps see it normally) while
-                also forwarding it watch-only to the engine, which uses
-                it for seam detection and chord arming
-    controlling forward it to the engine (swallowed at the tap) and hide
-                the cursor
-    remote      physical mouse movement, clicks, and wheel input release
-                control locally; keys still reach the engine so the
-                emergency escape chord is detected before input is swallowed
+                also observing it watch-only (seam detection, chord
+                arming). Local-mode input is never transmitted.
+    controlling swallow the event (return None) and forward it to the
+                engine, which drives the peer; the cursor is hidden and
+                the hardware cursor is disassociated before forwarding
+                starts, and the first post-entry motion event (which can
+                carry a stale delta) is discarded.
+    remote      keys pass through (the local user keeps the keyboard and
+                the emergency chord) while mouse/buttons/wheel are
+                swallowed: the peer owns the pointer.
 
-Injected events carry a kCGEventSourceUserData sentinel and the
-native pid; the tap drops anything marked like that, so input never
-echoes. The return seam is detected at injection time (the peer drives
-our cursor with absolute moves), not by a poller.
+The Quartz callback must return quickly or macOS disables the tap. It
+therefore only reads cheap fields, retains the event, and appends a
+compact record to a bounded queue drained by a worker thread. The
+overflow policy drops or evicts mouse-motion records; key/button
+transitions are never dropped, so a stuck modifier is impossible.
+
+Injected events carry a kCGEventSourceUserData sentinel; the tap drops
+anything marked like that, so input never echoes. Only the sentinel is
+trusted - the process-id check was removed because sandboxed/reblessed
+processes do not reliably report the pid Quartz expects.
+
+Relative remote motion is injected as an absolute MouseMoved posted from
+an application-maintained software cursor position (clamped to the
+layout), never by warping the real cursor per event. The real cursor is
+warped only for placement (handoff entry/return). The return seam is
+detected at injection time (the peer drives our cursor with absolute
+moves), not by a poller.
+
+If macOS disables the tap (timeout or user input), the platform
+immediately: releases all pressed/injected keys and buttons, re-associates
+the mouse, shows the cursor, returns to local mode, and tells the engine
+so the peer no longer believes it owns this machine. Only then is the tap
+re-enabled.
 
 Requires Accessibility permission for both the event tap and CGEventPost
 (CGPreflightListenEventAccess / CGPreflightPostEventAccess).
@@ -30,6 +52,10 @@ import time
 from .kvm_geometry import Monitor, ScreenLayout, in_jump_zone
 
 SENTINEL = 0x5E4C0DE5
+
+# Max records waiting for the worker. The tap callback must never block,
+# so when this is full the overflow policy drops motion (never keys).
+_TAP_QUEUE_MAX = 512
 
 try:
     import Quartz
@@ -80,6 +106,25 @@ class MacInputPlatform:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._callback_ref = None
+        # Bounded tap queue: the Quartz callback enqueues (mode, etype,
+        # retained event) records; the worker thread translates and calls
+        # the engine. See module docstring for the overflow policy.
+        self._input_queue: collections.deque = collections.deque()
+        self._queue_cv = threading.Condition()
+        self._tap_worker = None
+        # First mouse-motion event after entering "controlling" can carry
+        # a stale pre-disassociation delta; it is discarded.
+        self._ignore_next_motion = False
+        # Software cursor for relative injection (never per-event warping).
+        self._soft_x = 0
+        self._soft_y = 0
+        self._soft_valid = False
+        # Physical keys observed at the tap, and keys/buttons this process
+        # injected: released together when the tap dies or ownership ends.
+        self._pressed_keys: set = set()
+        self._injected_keys: set = set()
+        self._injected_buttons: set = set()
+        self._cursor_hidden = False
         # F6 diagnostics: counters, never toasted per event.
         self._stats = {
             "tap_keys": 0,
@@ -87,10 +132,15 @@ class MacInputPlatform:
             "hid_unmapped": 0,
             "exceptions": 0,
             "tap_disables": 0,
+            "tap_disables_timeout": 0,
+            "tap_disables_user": 0,
             "tap_restarts": 0,
             "assoc_false": 0,
             "assoc_true": 0,
             "assoc_errors": 0,
+            "queue_dropped_motion": 0,
+            "queue_dropped_critical": 0,
+            "worker_exceptions": 0,
         }
         self._first_exception = None
         # F6: every CGAssociateMouseAndMouseCursorPosition attempt, whether
@@ -132,6 +182,10 @@ class MacInputPlatform:
         self._callback_ref = self._make_callback()
         self._tap_thread = threading.Thread(target=self._tap_main, name="kvm-tap", daemon=True)
         self._tap_thread.start()
+        with self._queue_cv:
+            self._input_queue.clear()
+        self._tap_worker = threading.Thread(target=self._tap_worker_main, name="kvm-tap-worker", daemon=True)
+        self._tap_worker.start()
 
     def stop(self) -> None:
         # Never leave the user's pointing device decoupled if sharing stops
@@ -148,9 +202,16 @@ class MacInputPlatform:
                 pass
         if self._tap_thread is not None:
             self._tap_thread.join(timeout=2)
+        self._release_all_locally()
+        # Drain whatever the tap enqueued before it stopped, then stop.
+        self._drain_queue()
+        worker = self._tap_worker
+        if worker is not None:
+            worker.join(timeout=2)
         with self._lock:
             self._tap_port = None
             self._tap_runloop = None
+            self._tap_worker = None
 
     def permission_ok(self) -> bool:
         if not _QUARTZ_OK:
@@ -202,15 +263,46 @@ class MacInputPlatform:
             if event is None:
                 return None
             if etype in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
-                self._bump("tap_disables")
-                with self._lock:
-                    port = self._tap_port
-                if port is not None:
-                    Quartz.CGEventTapEnable(port, True)
+                which = "timeout" if etype == Quartz.kCGEventTapDisabledByTimeout else "user"
+                self._on_tap_disabled(which)
                 return None
             return self._handle_tap(etype, event)
 
         return cb
+
+    def _on_tap_disabled(self, which: str) -> None:
+        """macOS disabled our tap (missed deadline or system/user input).
+
+        Recovery must not leave the peer believing it owns this Mac: the
+        input is no longer being captured, so ownership is invalidated,
+        everything pressed/injected is released, the mouse is re-associated
+        and the cursor shown - and only then is the tap re-enabled. The
+        two disable causes are logged separately; "user" input may be a
+        system-level condition that will disable the tap again.
+        """
+        self._bump("tap_disables")
+        self._bump("tap_disables_timeout" if which == "timeout" else "tap_disables_user")
+        with self._lock:
+            mode = self._mode
+        if mode != "local":
+            self._release_all_locally()
+            self._record_assoc(True, f"tap-disable-{which}")
+            self.show_cursor()
+            with self._lock:
+                self._mode = "local"
+            engine = self.engine
+            if engine is not None:
+                try:
+                    engine.on_platform_input_lost()
+                except Exception:
+                    pass
+        with self._lock:
+            port = self._tap_port
+        if port is not None:
+            try:
+                Quartz.CGEventTapEnable(port, True)
+            except Exception:
+                pass
 
     def _tap_main(self) -> None:
         q = _q()
@@ -237,29 +329,151 @@ class MacInputPlatform:
         CFMachPortInvalidate(tap)
 
     def _handle_tap(self, etype, event):
+        """Quartz callback: fast path only.
+
+        Reads cheap fields, captures the mode, retains the event, appends
+        a compact record to the bounded queue and returns. Nothing here
+        may block, raise, or call the engine: macOS disables taps whose
+        callbacks miss their deadline.
+        """
         q = _q()
         now = time.monotonic()
         with self._lock:
             self._last_any = now
             if etype in (q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged):
                 self._last_key = now
-        if self._mode == "local":
-            # Pass-through: return the original event so apps see it
-            # normally, but still forward it watch-only to the engine
-            # (seam detection, chord arming).
-            self._forward_local(event, etype)
-            return event
-        if self._mode == "controlling":
-            self._forward(event, etype)
-            return None
-        if self._mode == "remote":
-            self._forward_remote_input(event, etype)
-            return None
-        return None
+            mode = self._mode
+        retain = getattr(q, "CGEventRetain", None)
+        if retain is not None:
+            try:
+                retain(event)
+            except Exception:
+                pass
+        if not self._enqueue((mode, etype, event)):
+            self._handle_queue_overflow((mode, etype, event))
+        # Swallow everything unless the local user should see it: local
+        # mode passes through, remote mode passes keys through (the user
+        # keeps the keyboard and the emergency chord), controlling mode
+        # never leaks the physical event to apps.
+        return event if mode in ("local", "remote") else None
 
-    def _forward_local(self, event, etype) -> None:
-        """Watch-only copy of local-mode input (never suppresses anything)."""
-        self._forward(event, etype)
+    def _enqueue(self, record) -> bool:
+        with self._queue_cv:
+            if len(self._input_queue) < _TAP_QUEUE_MAX:
+                self._input_queue.append(record)
+                self._queue_cv.notify()
+                return True
+        return False
+
+    def _is_motion(self, etype) -> bool:
+        q = _q()
+        return etype in (
+            q.kCGEventMouseMoved,
+            q.kCGEventLeftMouseDragged,
+            q.kCGEventRightMouseDragged,
+            q.kCGEventOtherMouseDragged,
+        )
+
+    def _release_event(self, event) -> None:
+        q = _q()
+        release = getattr(q, "CGEventRelease", None)
+        if release is not None:
+            try:
+                release(event)
+            except Exception:
+                pass
+
+    def _handle_queue_overflow(self, record) -> None:
+        """Bounded-queue overflow: never drop key/button transitions.
+
+        A full queue drops new motion outright; when the new record is a
+        key/button (critical), the oldest motion record is evicted to make
+        room. Only if the queue holds nothing but critical records is the
+        oldest one dropped (extreme overload; the tap is failing anyway).
+        """
+        mode, etype, event = record
+        if self._is_motion(etype):
+            self._bump("queue_dropped_motion")
+            self._release_event(event)
+            return
+        with self._queue_cv:
+            for i, (m, et, ev) in enumerate(self._input_queue):
+                if self._is_motion(et):
+                    del self._input_queue[i]
+                    self._bump("queue_dropped_motion")
+                    self._input_queue.append(record)
+                    self._queue_cv.notify()
+                    self._release_event(ev)
+                    return
+            if self._input_queue:
+                evicted = self._input_queue.popleft()
+                self._input_queue.append(record)
+                self._queue_cv.notify()
+                self._bump("queue_dropped_critical")
+                self._release_event(evicted)
+            else:
+                self._input_queue.append(record)
+                self._queue_cv.notify()
+
+    def _drain_queue(self) -> None:
+        with self._queue_cv:
+            items = list(self._input_queue)
+            self._input_queue.clear()
+        for item in items:
+            try:
+                self._process_record(*item)
+            except Exception:
+                pass
+
+    def _tap_worker_main(self) -> None:
+        while not self._stop.is_set():
+            with self._queue_cv:
+                if self._input_queue:
+                    item = self._input_queue.popleft()
+                else:
+                    item = None
+            if item is None:
+                self._queue_cv.wait(timeout=0.2)
+                continue
+            try:
+                self._process_record(*item)
+            except Exception as exc:
+                self._bump("worker_exceptions")
+                self._note_exception(exc)
+
+    def _process_record(self, mode, etype, event) -> None:
+        try:
+            if mode == "controlling":
+                self._enqueue_controlled_input(event, etype)
+            elif mode == "remote":
+                self._observe_remote(event, etype)
+            else:
+                self._observe_local(event, etype)
+        finally:
+            self._release_event(event)
+
+    def _observe_local(self, event, etype) -> None:
+        """Local mode: watch-only (seam detection, chord arming). Never
+        transmits ordinary input to the peer."""
+        self._forward(event, etype, mode="local")
+
+    def _enqueue_controlled_input(self, event, etype) -> None:
+        """Controlling mode: this machine's input drives the peer."""
+        self._forward(event, etype, mode="controlling")
+
+    def _observe_remote(self, event, etype) -> None:
+        """Remote mode: the peer owns the pointer, so mouse/buttons/wheel
+        are ignored; keys are observed so the emergency chord still works.
+        No input here ever releases or hands back control."""
+        q = _q()
+        engine = self.engine
+        if engine is None:
+            return
+        user = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUserData)
+        if user == SENTINEL:
+            return
+        if etype in (q.kCGEventKeyDown, q.kCGEventKeyUp, q.kCGEventFlagsChanged):
+            self._forward_keys(event, etype)
 
     def _forward_keys(self, event, etype) -> None:
         q = _q()
@@ -267,8 +481,10 @@ class MacInputPlatform:
         if engine is None:
             return
         user = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUserData)
-        pid = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUnixProcessID)
-        if user == SENTINEL or (pid and pid == os.getpid()):
+        # Sentinel-only filtering: injected events are recognized solely
+        # by the source-user-data sentinel. The old pid check was dropped
+        # (sandboxed/reblessed processes do not reliably report the pid).
+        if user == SENTINEL:
             return
         try:
             if etype == q.kCGEventKeyDown:
@@ -277,7 +493,9 @@ class MacInputPlatform:
                 hid = _mac_vk_to_hid(vk)
                 if hid is not None:
                     self._bump("hid_mapped")
-                    engine.on_local_key(hid, True)
+                    with self._lock:
+                        self._pressed_keys.add(hid)
+                    engine.observe_local_key(hid, True)
                 else:
                     self._bump("hid_unmapped")
             elif etype == q.kCGEventKeyUp:
@@ -288,7 +506,9 @@ class MacInputPlatform:
                 hid = _mac_vk_to_hid(vk)
                 if hid is not None:
                     self._bump("hid_mapped")
-                    engine.on_local_key(hid, False)
+                    with self._lock:
+                        self._pressed_keys.discard(hid)
+                    engine.observe_local_key(hid, False)
                 else:
                     self._bump("hid_unmapped")
             elif etype == q.kCGEventFlagsChanged:
@@ -296,47 +516,26 @@ class MacInputPlatform:
         except Exception as exc:
             self._note_exception(exc)
 
-    def _forward_remote_input(self, event, etype) -> None:
-        """Release remote control on real local pointer input.
+    def _forward(self, event, etype, mode=None) -> None:
+        """Translate one tapped event for the engine.
 
-        The injected CGEvents carry our sentinel, so they never take this
-        path.  That avoids treating an injected cursor landing at an edge as
-        a request to immediately hand control back.
+        ``mode`` is the delegation captured when the event was enqueued
+        (the callback must not re-read state), defaulting to the current
+        mode for direct test/injection callers. Observation and control
+        are explicit and never share a call path: watch-only modes call
+        the engine's observe_* methods, controlling mode additionally
+        calls send_controlled_*.
         """
         q = _q()
         engine = self.engine
         if engine is None:
             return
+        if mode is None:
+            with self._lock:
+                mode = self._mode
         user = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUserData)
-        pid = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUnixProcessID)
-        if user == SENTINEL or (pid and pid == os.getpid()):
-            return
-        pointer_events = (
-            q.kCGEventMouseMoved,
-            q.kCGEventLeftMouseDragged,
-            q.kCGEventRightMouseDragged,
-            q.kCGEventOtherMouseDragged,
-            q.kCGEventLeftMouseDown,
-            q.kCGEventLeftMouseUp,
-            q.kCGEventRightMouseDown,
-            q.kCGEventRightMouseUp,
-            q.kCGEventOtherMouseDown,
-            q.kCGEventOtherMouseUp,
-            q.kCGEventScrollWheel,
-        )
-        if etype in pointer_events:
-            engine.on_remote_local_input(origin="mac-pointer")
-            return
-        self._forward_keys(event, etype)
-
-    def _forward(self, event, etype) -> None:
-        q = _q()
-        engine = self.engine
-        if engine is None:
-            return
-        user = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUserData)
-        pid = q.CGEventGetIntegerValueField(event, q.kCGEventSourceUnixProcessID)
-        if user == SENTINEL or (pid and pid == os.getpid()):
+        # Sentinel-only filtering (see module docstring).
+        if user == SENTINEL:
             return
         try:
             if etype == q.kCGEventKeyDown:
@@ -345,7 +544,11 @@ class MacInputPlatform:
                 hid = _mac_vk_to_hid(vk)
                 if hid is not None:
                     self._bump("hid_mapped")
-                    engine.on_local_key(hid, True)
+                    with self._lock:
+                        self._pressed_keys.add(hid)
+                    engine.observe_local_key(hid, True)
+                    if mode == "controlling":
+                        engine.send_controlled_key(hid, True)
                 else:
                     self._bump("hid_unmapped")
             elif etype == q.kCGEventKeyUp:
@@ -356,21 +559,41 @@ class MacInputPlatform:
                 hid = _mac_vk_to_hid(vk)
                 if hid is not None:
                     self._bump("hid_mapped")
-                    engine.on_local_key(hid, False)
+                    with self._lock:
+                        self._pressed_keys.discard(hid)
+                    engine.observe_local_key(hid, False)
+                    if mode == "controlling":
+                        engine.send_controlled_key(hid, False)
                 else:
                     self._bump("hid_unmapped")
             elif etype == q.kCGEventFlagsChanged:
                 self._forward_flags(event)
+                if mode == "controlling":
+                    vk = q.CGEventGetIntegerValueField(event, q.kCGKeyboardEventKeycode)
+                    hid = _mac_vk_to_hid(vk)
+                    if hid is not None:
+                        bit = _VK_FLAG_BITS.get(int(vk))
+                        if bit is not None:
+                            engine.send_controlled_key(hid, bool(q.CGEventGetFlags(event) & bit))
             elif etype in (
                 q.kCGEventMouseMoved,
                 q.kCGEventLeftMouseDragged,
                 q.kCGEventRightMouseDragged,
                 q.kCGEventOtherMouseDragged,
             ):
+                if mode == "controlling":
+                    # The first motion event after disassociation can
+                    # carry a large stale pre-entry delta; discard it.
+                    with self._lock:
+                        if self._ignore_next_motion:
+                            self._ignore_next_motion = False
+                            return
                 dx = q.CGEventGetIntegerValueField(event, q.kCGMouseEventDeltaX)
                 dy = q.CGEventGetIntegerValueField(event, q.kCGMouseEventDeltaY)
                 pos = q.CGEventGetLocation(event)
-                engine.on_local_mouse(dx, dy, int(pos.x), int(pos.y))
+                engine.observe_local_mouse(dx, dy, int(pos.x), int(pos.y))
+                if mode == "controlling":
+                    engine.send_controlled_mouse(dx, dy)
             elif etype in (
                 q.kCGEventLeftMouseDown,
                 q.kCGEventLeftMouseUp,
@@ -385,11 +608,17 @@ class MacInputPlatform:
                     q.kCGEventRightMouseDown,
                     q.kCGEventOtherMouseDown,
                 )
-                engine.on_local_button(button, down)
+                if mode == "controlling":
+                    engine.send_controlled_button(button, down)
+                else:
+                    engine.observe_local_button(button, down)
             elif etype == q.kCGEventScrollWheel:
                 dy = q.CGEventGetIntegerValueField(event, q.kCGScrollWheelEventDeltaAxis1)
                 dx = q.CGEventGetIntegerValueField(event, q.kCGScrollWheelEventDeltaAxis2)
-                engine.on_local_wheel(int(round(dy * 120)), int(round(dx * 120)))
+                if mode == "controlling":
+                    engine.send_controlled_wheel(int(round(dy * 120)), int(round(dx * 120)))
+                else:
+                    engine.observe_local_wheel(int(round(dy * 120)), int(round(dx * 120)))
         except Exception as exc:
             self._note_exception(exc)
 
@@ -426,7 +655,7 @@ class MacInputPlatform:
             self._bump("hid_unmapped")
             return
         self._bump("hid_mapped")
-        self.engine.on_local_key(hid, bool(q.CGEventGetFlags(event) & bit))
+        self.engine.observe_local_key(hid, bool(q.CGEventGetFlags(event) & bit))
 
     # -- delegation ------------------------------------------------------------
 
@@ -464,28 +693,77 @@ class MacInputPlatform:
         ``_mode`` flips only after the Quartz call succeeds: a failed
         CGAssociate... call must never leave the platform believing it is
         decoupled when it is not (F2) - that is the stuck-cursor symptom.
+
+        Entering "controlling" is ordered (review F3): hide the cursor,
+        park it, disassociate the hardware mouse, then mark the first
+        post-entry motion event as discardable, and only then flip mode.
+        Entering "remote" resets the software-cursor position so the next
+        relative move is re-derived from the real cursor (handoff entry).
         """
-        if state in ("remote", "controlling"):
-            # Decouples hardware mouse deltas from the on-screen cursor.
-            # Needed in both directions: "remote" so injected absolute moves
-            # aren't fought by the local trackpad's own accumulator, and
-            # "controlling" so the cursor actually stops moving locally -
-            # swallowing the CGEvent in the tap callback only stops apps
-            # from seeing it, it does not stop WindowServer from moving the
-            # cursor sprite off raw HID deltas.
+        if state == "controlling":
+            # 1. Hide and park the cursor so disassociated hardware deltas
+            #    have nowhere to land. Re-applying while already controlling
+            #    must not hide again (ShowCursor/HideCursor are refcounted).
+            q = _q()
+            with self._lock:
+                already = self._mode == "controlling"
+            if not already:
+                try:
+                    q.CGDisplayHideCursor(q.CGMainDisplayID())
+                    with self._lock:
+                        self._cursor_hidden = True
+                except Exception:
+                    pass
+                try:
+                    self.warp_cursor(*self._park_position())
+                except Exception:
+                    pass
+            # 2. Decouple hardware mouse deltas from the cursor.
+            if not self._record_assoc(False, state):
+                # Failure must not leave the cursor hidden behind a lie.
+                with self._lock:
+                    hidden = self._cursor_hidden
+                if hidden:
+                    try:
+                        self.show_cursor()
+                    except Exception:
+                        pass
+                return False
+            with self._lock:
+                self._ignore_next_motion = True
+                self._mode = state
+            return True
+        if state == "remote":
+            # Decouples hardware mouse deltas from the on-screen cursor so
+            # injected absolute moves aren't fought by the local trackpad's
+            # own accumulator.
             if not self._record_assoc(False, state):
                 return False
             with self._lock:
                 self._mode = state
+                self._soft_valid = False
             return True
         if state == "local":
             if not self._record_assoc(True, state):
                 return False
             with self._lock:
                 self._mode = state
-            self.show_cursor()
+            with self._lock:
+                hidden = self._cursor_hidden
+            if hidden:
+                self.show_cursor()
+                with self._lock:
+                    self._cursor_hidden = False
             return True
         return False
+
+    def _park_position(self) -> tuple[int, int]:
+        """Center of the layout to park the cursor on controlling entry."""
+        try:
+            layout = self.screen_layout()
+            return layout.left() + layout.width() // 2, layout.top() + layout.height() // 2
+        except Exception:
+            return self.cursor_position()
 
     def keyboard_health(self) -> str:
         """F7: "ok", "idle", "no_keys" or "stalled".
@@ -532,6 +810,10 @@ class MacInputPlatform:
         with self._lock:
             self._tap_port = None
             self._tap_runloop = None
+        with self._queue_cv:
+            # Records captured by the dead tap are stale.
+            while self._input_queue:
+                self._release_event(self._input_queue.popleft()[2])
         if self._stop.is_set() or self.engine is None:
             return
         try:
@@ -573,30 +855,57 @@ class MacInputPlatform:
     def hide_cursor(self) -> None:
         q = _q()
         q.CGDisplayHideCursor(q.CGMainDisplayID())
+        with self._lock:
+            self._cursor_hidden = True
 
     def show_cursor(self) -> None:
         q = _q()
         q.CGDisplayShowCursor(q.CGMainDisplayID())
+        with self._lock:
+            self._cursor_hidden = False
 
     # -- injection ---------------------------------------------------------------
 
     def inject_move_rel(self, dx: int, dy: int) -> None:
+        """Relative remote motion via an application-maintained software
+        cursor, clamped to the layout - never per-event warping (repeated
+        warping interferes with tap deltas and event suppression). The
+        real cursor is warped only for placement at handoff entry/return.
+        """
         q = _q()
-        x, y = self.cursor_position()
-        nx, ny = x + dx, y + dy
-        self.warp_cursor(nx, ny)
-        ev = q.CGEventCreateMouseEvent(None, q.kCGEventMouseMoved, (nx, ny), q.kCGMouseButtonLeft)
-        q.CGEventSetIntegerValueField(ev, q.kCGMouseEventDeltaX, dx)
-        q.CGEventSetIntegerValueField(ev, q.kCGMouseEventDeltaY, dy)
+        with self._lock:
+            if not self._soft_valid:
+                # Handoff entry: derive the software position from the
+                # real cursor exactly once.
+                try:
+                    sx, sy = self.cursor_position()
+                except Exception:
+                    sx, sy = 0, 0
+                self._soft_x, self._soft_y = sx, sy
+                self._soft_valid = True
+            nx = self._soft_x + dx
+            ny = self._soft_y + dy
+            self._soft_x, self._soft_y = nx, ny
+        try:
+            layout = self.screen_layout()
+            nx = min(max(nx, layout.left()), layout.right() - 1)
+            ny = min(max(ny, layout.top()), layout.bottom() - 1)
+            self._soft_x, self._soft_y = nx, ny
+        except Exception:
+            pass
+        ev = q.CGEventCreateMouseEvent(None, q.kCGEventMouseMoved, (self._soft_x, self._soft_y), q.kCGMouseButtonLeft)
         q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserData, SENTINEL)
         # Session-tap posting is below our HID capture tap, so the injected
-        # event reaches the target app without being mistaken for local input.
+        # event reaches the target app without being mistaken for local
+        # input; the sentinel is the safety net either way.
         q.CGEventPost(q.kCGSessionEventTap, ev)
-        self._report_edge(nx, ny)
+        self._report_edge(self._soft_x, self._soft_y)
 
     def inject_move_abs(self, x: int, y: int) -> None:
         q = _q()
-        self.warp_cursor(x, y)
+        with self._lock:
+            self._soft_x, self._soft_y = x, y
+            self._soft_valid = True
         ev = q.CGEventCreateMouseEvent(None, q.kCGEventMouseMoved, (x, y), q.kCGMouseButtonLeft)
         q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserData, SENTINEL)
         q.CGEventPost(q.kCGSessionEventTap, ev)
@@ -630,6 +939,11 @@ class MacInputPlatform:
         ev = q.CGEventCreateMouseEvent(None, etype, pos, field)
         q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserData, SENTINEL)
         q.CGEventPost(q.kCGSessionEventTap, ev)
+        with self._lock:
+            if down:
+                self._injected_buttons.add(button)
+            else:
+                self._injected_buttons.discard(button)
 
     def inject_wheel(self, dy: int, dx: int) -> None:
         q = _q()
@@ -647,6 +961,41 @@ class MacInputPlatform:
         ev = q.CGEventCreateKeyboardEvent(None, vk, down)
         q.CGEventSetIntegerValueField(ev, q.kCGEventSourceUserData, SENTINEL)
         q.CGEventPost(q.kCGSessionEventTap, ev)
+        with self._lock:
+            if down:
+                self._injected_keys.add(hid)
+            else:
+                self._injected_keys.discard(hid)
+
+    def _release_all_locally(self) -> None:
+        """Release everything this machine is holding: physical keys
+        observed at the tap and keys/buttons this process injected.
+
+        Called when the tap dies, on ownership changes, and on shutdown
+        so no key/button can be left stuck on this Mac.
+        """
+        with self._lock:
+            keys = sorted(self._pressed_keys)
+            self._pressed_keys.clear()
+            injected = sorted(self._injected_keys)
+            self._injected_keys.clear()
+            buttons = sorted(self._injected_buttons)
+            self._injected_buttons.clear()
+        for hid in keys:
+            try:
+                self.inject_key(hid, False)
+            except Exception:
+                pass
+        for hid in injected:
+            try:
+                self.inject_key(hid, False)
+            except Exception:
+                pass
+        for button in buttons:
+            try:
+                self.inject_button(button, False)
+            except Exception:
+                pass
 
 
 # -- module helpers --------------------------------------------------------------
@@ -707,17 +1056,29 @@ def main():
         def on_status(self, msg):
             print(f"[status] {msg}", flush=True)
 
-        def on_local_mouse(self, dx, dy, x, y):
+        def observe_local_mouse(self, dx, dy, x, y):
             print(f"  mouse rel=({dx},{dy}) abs=({x},{y})", flush=True)
 
-        def on_local_button(self, button, down):
+        def observe_local_button(self, button, down):
             print(f"  button {button} {'down' if down else 'up'}", flush=True)
 
-        def on_local_wheel(self, dy, dx):
+        def observe_local_wheel(self, dy, dx):
             print(f"  wheel dy={dy} dx={dx}", flush=True)
 
-        def on_local_key(self, hid, down):
+        def observe_local_key(self, hid, down):
             print(f"  key hid=0x{hid:02x} {'down' if down else 'up'}", flush=True)
+
+        def send_controlled_mouse(self, dx, dy):
+            print(f"  -> send mouse rel=({dx},{dy})", flush=True)
+
+        def send_controlled_button(self, button, down):
+            print(f"  -> send button {button} {'down' if down else 'up'}", flush=True)
+
+        def send_controlled_wheel(self, dy, dx):
+            print(f"  -> send wheel dy={dy} dx={dx}", flush=True)
+
+        def send_controlled_key(self, hid, down):
+            print(f"  -> send key hid=0x{hid:02x} {'down' if down else 'up'}", flush=True)
 
         def on_remote_edge(self, side, x, y):
             print(f"  edge {side} at ({x},{y})", flush=True)
@@ -801,16 +1162,28 @@ def _controller_spike(args) -> None:
         def on_status(self, msg):
             print(f"[status] {msg}", flush=True)
 
-        def on_local_mouse(self, dx, dy, x, y):
+        def observe_local_mouse(self, dx, dy, x, y):
             print(f"  mouse rel=({dx},{dy}) abs=({x},{y})", flush=True)
 
-        def on_local_button(self, button, down):
+        def observe_local_button(self, button, down):
             pass
 
-        def on_local_wheel(self, dy, dx):
+        def observe_local_wheel(self, dy, dx):
             pass
 
-        def on_local_key(self, hid, down):
+        def observe_local_key(self, hid, down):
+            pass
+
+        def send_controlled_mouse(self, dx, dy):
+            print(f"  -> send mouse rel=({dx},{dy})", flush=True)
+
+        def send_controlled_button(self, button, down):
+            pass
+
+        def send_controlled_wheel(self, dy, dx):
+            pass
+
+        def send_controlled_key(self, hid, down):
             pass
 
         def on_remote_edge(self, side, x, y):

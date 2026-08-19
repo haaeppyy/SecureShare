@@ -6,17 +6,24 @@ Wire layout of one event frame (inside the KVM channel):
 
 where the plaintext is:
 
-    [1-byte kind][body]
+    [4-byte BE handoff_id][4-byte BE sequence][1-byte kind][body]
 
-Bodies are struct-packed (big-endian) per the kind table. No JSON, no
-base64: mouse events arrive at hundreds of hertz and the framing must be
-cheap on both ends. The crypto (nonces, counters) lives in kvm.py.
+The handoff_id binds every frame to the handoff/session that created it
+(a stale frame from an old session can never be mistaken for a new one)
+and the sequence number gives the receiver monotonic per-direction
+ordering for replay protection. Bodies are struct-packed (big-endian)
+per the kind table. No JSON, no base64: mouse events arrive at hundreds
+of hertz and the framing must be cheap on both ends. The crypto
+(nonces, counters) lives in kvm.py.
 """
 
 import json
 import struct
 
 from .transfer import ProtocolError
+
+# Header: handoff_id + per-direction sequence number.
+FRAME_HEADER = struct.Struct(">II")
 
 KIND_MOUSE_MOVE_REL = 0x01
 KIND_MOUSE_MOVE_ABS = 0x02
@@ -83,18 +90,23 @@ ERR_BUSY = 3
 ERR_UNSUPPORTED = 4
 
 
-def pack_event(kind: int, body: bytes = b"") -> bytes:
-    """Prepend the kind byte to a body."""
+def pack_frame(handoff_id: int, seq: int, kind: int, body: bytes = b"") -> bytes:
+    """Assemble one plaintext frame: header + kind byte + body."""
     if not 0 <= kind <= 0xFF:
         raise ValueError(f"kind {kind} out of range")
-    return bytes([kind]) + body
+    if not 0 <= handoff_id <= 0xFFFFFFFF:
+        raise ValueError(f"handoff_id {handoff_id} out of range")
+    if not 0 <= seq <= 0xFFFFFFFF:
+        raise ValueError(f"seq {seq} out of range")
+    return FRAME_HEADER.pack(handoff_id, seq) + bytes([kind]) + body
 
 
-def unpack_event(data: bytes) -> tuple[int, bytes]:
-    """Split a plaintext into (kind, body)."""
-    if not data:
-        raise ProtocolError("empty event frame")
-    return data[0], data[1:]
+def unpack_frame(data: bytes) -> tuple[int, int, int, bytes]:
+    """Split a plaintext into (handoff_id, seq, kind, body)."""
+    if len(data) < FRAME_HEADER.size + 1:
+        raise ProtocolError("short event frame")
+    handoff_id, seq = FRAME_HEADER.unpack_from(data, 0)
+    return handoff_id, seq, data[FRAME_HEADER.size], data[FRAME_HEADER.size + 1:]
 
 
 def encode_rel(dx: int, dy: int) -> bytes:
@@ -209,6 +221,9 @@ def decode_error(body: bytes) -> tuple[int, str]:
 # control messages can be ignored by both peers. CONTROL_REVERT and
 # CONTROL_CANCEL append a UTF-8 reason string (peer-edge, escape, denied,
 # topology, busy, timeout, edge-left, platform, disabled, channel-lost...).
+# The plaintext frame header additionally carries the *active* handoff_id
+# and a per-direction sequence number; input frames (mouse/key/modifiers)
+# are rejected by the receiver unless both match the live session.
 
 
 def encode_control_request(handoff_id: int, entry_x: int, entry_y: int, modifier_mask: int) -> bytes:
@@ -230,6 +245,15 @@ def decode_handoff_id(body: bytes) -> int:
         raise ProtocolError("bad handoff_id body")
     (handoff_id,) = struct.unpack(">I", body)
     return handoff_id
+
+
+def encode_all_keys_up(handoff_id: int) -> bytes:
+    """KIND_ALL_KEYS_UP body: the session that is being cleaned up.
+
+    The receiver ignores the cleanup when a *newer* handoff is active, so
+    a delayed release frame can never clear a newer session's keys.
+    """
+    return encode_handoff_id(handoff_id)
 
 
 def encode_handoff_message(handoff_id: int, reason: str = "") -> bytes:

@@ -2,11 +2,18 @@
 
 The control flow is an acknowledged handoff, never a direct takeover:
 
-    controller:  edge hit -> requesting -> (READY) -> controlling -> (ACTIVE)
+    controller:  chord/edge -> requesting -> (READY) -> controlling -> (ACTIVE)
     target:      (REQUEST) -> remote_preparing -> remote
 
 Local input is suppressed only after CONTROL_ACTIVE: the controller's
 platform delegation stays "local" until the remote confirmed.
+
+Ownership policy (Stage 1): control is explicit.  The Ctrl+Alt+Space chord
+both requests control (when idle) and releases it (when active); physical
+input on the controlled device NEVER hands control back - only the chord,
+the lease (6 s without renewal), or a disconnect does.  Edge-seam handoff
+machinery still exists behind ``edge_handoff_enabled`` and tests that
+exercise the seam set it explicitly.
 """
 
 import base64
@@ -22,12 +29,19 @@ import pytest
 from core import crypto
 from core.kvm import KVMEngine, KvmChannel
 from core.kvm_events import (
+    KIND_ALL_KEYS_UP,
+    KIND_CONTROL_REVERT,
+    unpack_frame,
+)
+from core.kvm_events import (
     KIND_CONTROL_BEGIN,
     KIND_CONTROL_REQUEST,
     KIND_KEY_DOWN,
     KIND_MOUSE_MOVE_REL,
     encode_control_request,
     encode_key,
+    pack_frame,
+    unpack_frame,
 )
 from core.kvm_geometry import Monitor, ScreenLayout
 from core.kvm_keymap import mac_vk_to_hid
@@ -102,24 +116,36 @@ class FakePlatform:
         self.injected.append(("key", hid, down))
 
     # -- simulated physical input ----------------------------------------------
+    # The platform is the dispatcher: observation is always reported
+    # (seam/chord), transmission only while controlling.
 
     def move(self, dx, dy):
         x, y = self.cursor
         nx, ny = x + dx, y + dy
         self.cursor = (nx, ny)
-        self.engine.on_local_mouse(dx, dy, nx, ny)
+        self.engine.observe_local_mouse(dx, dy, nx, ny)
+        if self.delegation == "controlling":
+            self.engine.send_controlled_mouse(dx, dy)
 
     def press(self, hid):
-        self.engine.on_local_key(hid, True)
+        self.engine.observe_local_key(hid, True)
+        if self.delegation == "controlling":
+            self.engine.send_controlled_key(hid, True)
 
     def release(self, hid):
-        self.engine.on_local_key(hid, False)
+        self.engine.observe_local_key(hid, False)
+        if self.delegation == "controlling":
+            self.engine.send_controlled_key(hid, False)
 
     def click(self, button, down):
-        self.engine.on_local_button(button, down)
+        self.engine.observe_local_button(button, down)
+        if self.delegation == "controlling":
+            self.engine.send_controlled_button(button, down)
 
     def scroll(self, dy, dx=0):
-        self.engine.on_local_wheel(dy, dx)
+        self.engine.observe_local_wheel(dy, dx)
+        if self.delegation == "controlling":
+            self.engine.send_controlled_wheel(dy, dx)
 
     def edge(self, side, x, y):
         self.engine.on_remote_edge(side, x, y)
@@ -166,15 +192,27 @@ def wait_injected(plat, item, timeout=5.0):
     assert ok, f"{item!r} never reached {plat.name}; got {plat.injected!r}"
 
 
+def chord(plat, release=True):
+    """Press Ctrl+Alt+Space (the ownership chord) on a platform."""
+    for hid in (0x94, 0x96):  # left ctrl + left alt
+        plat.press(hid)
+    plat.press(0x2C)  # space completes ctrl+alt+space
+    if release:
+        plat.release(0x2C)
+        for hid in (0x94, 0x96):
+            plat.release(hid)
+
+
 def take_control(pair, plat_a, plat_b):
     """Drive the full acknowledged handoff A -> B and return when active.
 
-    A parks on its right seam (x=1440) which triggers the request; the
-    handshake completes when B is remote and A's delegation is
-    "controlling" (input suppressed on A only after ACTIVE).
+    A presses the ownership chord (Ctrl+Alt+Space), which requests control
+    of the single ready peer; the handshake completes when B is remote and
+    A's delegation is "controlling" (input suppressed on A only after
+    ACTIVE).
     """
     fp_b = pair.b.store.fingerprint()
-    plat_a.move(740, 0)  # cursor -> (1440, 450): A's right seam / jump zone
+    chord(plat_a)
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting")
     assert ok, f"A never entered requesting; got {pair.a.kvm._state}"
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "controlling")
@@ -210,9 +248,8 @@ def test_take_control_and_drive(node_pair_ctx):
     fp_b = take_control(pair, plat_a, plat_b)
     assert plat_b.delegation == "remote"
 
-    # The handoff starts comfortably inside B's left edge so residual motion
-    # from crossing the seam cannot immediately pin the pointer at the edge.
-    assert ("abs", 48, 540) in plat_b.injected
+    # The handoff parks at B's screen center (the chord request has no seam).
+    assert ("abs", 960, 540) in plat_b.injected
 
     # relative moves stream across
     plat_a.move(10, 20)
@@ -248,8 +285,10 @@ def test_key_autorepeat_forwarded_to_target(node_pair_ctx):
     fp_b = take_control(pair, plat_a, plat_b)
     hid = mac_vk_to_hid(0x33)  # Backspace
     for _ in range(3):
-        pair.a.kvm.on_local_key(hid, True)
-    pair.a.kvm.on_local_key(hid, False)
+        pair.a.kvm.observe_local_key(hid, True)
+        pair.a.kvm.send_controlled_key(hid, True)
+    pair.a.kvm.observe_local_key(hid, False)
+    pair.a.kvm.send_controlled_key(hid, False)
     ok = wait_for(
         lambda: sum(1 for i in plat_b.injected if i == ("key", hid, True)) >= 3,
         timeout=5,
@@ -272,7 +311,7 @@ def test_no_suppression_before_active(node_pair_ctx, monkeypatch):
         pending_begin.append((channel, body))  # swallow BEGIN: no ACTIVE yet
 
     monkeypatch.setattr(pair.b.kvm, "_on_control_begin", stalled_begin)
-    plat_a.move(740, 0)  # request starts
+    chord(plat_a)  # request starts
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting")
     assert ok
     # READY arrived: A is "controlling" (waiting_active), cursor parked, but
@@ -297,41 +336,44 @@ def test_no_suppression_before_active(node_pair_ctx, monkeypatch):
     assert ok, "handoff never completed after un-stalling"
 
 
-def test_hand_back_on_local_pointer_input(node_pair_ctx):
+def test_physical_input_on_target_does_not_hand_back(node_pair_ctx):
+    """Stage 1 explicit ownership: a real pointer move on the controlled
+    device must NOT end sharing. Only the chord (or lease/disconnect) does.
+    """
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
     fp_b = take_control(pair, plat_a, plat_b)
-    # A real pointer move on the controlled device ends sharing.  An
-    # injected cursor reaching a peer edge must not cause an oscillation.
-    plat_b.move(1, 0)
+    plat_b.move(1, 0)  # physical pointer move on the controlled device
+    time.sleep(0.3)  # give the old auto-revert policy time to (wrongly) fire
+    assert pair.a.kvm._state.get(fp_b) == "controlling"
+    assert pair.b.kvm.control_state(pair.a.store.fingerprint()) == "remote"
+    assert plat_b.delegation == "remote"
+    assert pair.b.kvm._stats.get("reverts_sent", 0) == 0
+    # the chord still hands control back, restoring A's cursor at the seam
+    chord(plat_b)
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
     assert ok, "A never handed back control"
     assert plat_b.delegation == "local"
     assert plat_a.cursor[0] == 1435  # restored on A's seam, inset past jump zone
     assert abs(plat_a.cursor[1] - 450) <= 1  # mirrored y (fraction 0.5)
     assert plat_a.cursor_hidden is False
-    # the seam is inside the jump zone: a *deliberate* move back to the edge
-    # re-takes control, but a move away from it must not
-    plat_a.move(-10, 0)  # x -> 1425, off the seam
-    assert pair.a.kvm._state.get(fp_b) == "local"
-    plat_a.move(15, 0)  # x -> 1440, on the seam again: new handoff starts
-    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting")
-    assert ok
 
 
 def test_handback_blocks_former_controller_edge(node_pair_ctx):
-    """A normal target-driven revert must latch the former controller's edge.
+    """A target-driven revert must latch the former controller's edge.
 
-    B's physical input hands control back; A's edge stays blocked while the
+    B's chord hands control back; A's edge stays blocked while the
     cursor remains near it (LATCH_ZONE), so residual motion cannot start a
     fresh CONTROL_REQUEST.  Leaving the edge clears the latch, and a
-    deliberate re-entry is allowed again.
+    deliberate re-entry is allowed again (seam handoff re-enabled here to
+    exercise the latch machinery).
     """
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
     fp_b = pair.b.store.fingerprint()
+    pair.a.kvm.edge_handoff_enabled = True
     take_control(pair, plat_a, plat_b)
-    plat_b.move(1, 0)  # physical local input on the target -> revert
+    chord(plat_b)  # B reclaims explicitly
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
     assert ok, "A never handed back control"
     assert pair.b.kvm.control_state(pair.a.store.fingerprint()) == "local"
@@ -365,7 +407,7 @@ def test_revert_sequence_recorded_in_diagnostics(node_pair_ctx):
     wait_linked(pair)
     fp_b = pair.b.store.fingerprint()
     take_control(pair, plat_a, plat_b)
-    plat_b.move(1, 0)  # physical local input on the target -> revert
+    chord(plat_b)  # B reclaims explicitly
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
     assert ok, "A never handed back control"
     # structured revert log: accepted then completed
@@ -395,8 +437,9 @@ def test_revert_grace_expires_allowing_edge_retake(node_pair_ctx):
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
     fp_b = pair.b.store.fingerprint()
+    pair.a.kvm.edge_handoff_enabled = True
     take_control(pair, plat_a, plat_b)
-    plat_b.move(1, 0)  # physical local input on the target -> revert
+    chord(plat_b)  # B reclaims explicitly
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
     assert ok
     assert pair.a.kvm._blocked_edge.get(fp_b) == "right"
@@ -420,6 +463,7 @@ def test_refusal_latch_never_expires(node_pair_ctx):
     wait_linked(pair)
     pair.b.store.set_peer_kvm_allowed(pair.a.store.fingerprint(), False)
     fp_b = pair.b.store.fingerprint()
+    pair.a.kvm.edge_handoff_enabled = True
     plat_a.move(740, 0)
     ok = wait_for(lambda: pair.a.kvm._blocked_edge.get(fp_b) is not None, timeout=5)
     assert ok, "A should have been refused"
@@ -439,11 +483,12 @@ def test_reverse_direction_handoff_after_handback(node_pair_ctx):
     fp_b = pair.b.store.fingerprint()
     fp_a = pair.a.store.fingerprint()
     take_control(pair, plat_a, plat_b)
-    plat_b.move(1, 0)  # B reclaims via physical input
+    chord(plat_b)  # B reclaims explicitly
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
     assert ok
     assert pair.a.kvm._blocked_edge.get(fp_b) == "right"
-    # B parks on its left seam (A sits at B's left edge).
+    # B crosses its own seam to control A (seam handoff re-enabled for B).
+    pair.b.kvm.edge_handoff_enabled = True
     plat_b.cursor = (700, 540)
     plat_b.move(-700, 0)  # -> (0, 540): B's left jump zone
     ok = wait_for(lambda: pair.b.kvm._state.get(fp_a) == "controlling", timeout=5)
@@ -468,10 +513,9 @@ def test_escape_latches_until_edge_exit_then_retake(node_pair_ctx):
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
     fp_b = pair.b.store.fingerprint()
+    pair.a.kvm.edge_handoff_enabled = True
     take_control(pair, plat_a, plat_b)
-    for hid in (0x94, 0x96):
-        plat_a.press(hid)
-    plat_a.press(0x2C)  # ctrl+alt+space
+    chord(plat_a)  # A releases via the chord
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
     assert ok
     assert wait_for(lambda: plat_b.delegation == "local", timeout=5)
@@ -510,8 +554,7 @@ def test_channel_loss_does_not_latch_and_recovers(node_pair_ctx):
     assert ok, "channel must re-establish after teardown"
     ok = wait_for(lambda: pair.a.kvm.link_status(fp_b) == "ready", timeout=5)
     assert ok, "screen info must be exchanged again before a fresh handoff"
-    plat_a.cursor = (700, 450)
-    plat_a.move(740, 0)  # -> (1440, 450)
+    chord(plat_a)
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "controlling", timeout=5)
     assert ok, "fresh handoff after channel loss failed"
     assert plat_b.delegation == "remote"
@@ -538,8 +581,8 @@ def test_controller_delegation_single_association_until_revert(node_pair_ctx):
         "delegation must not change while controlling"
     )
     assert pair.a.kvm.control_state(fp_b) == "controlling"
-    # Peer revert: exactly one local restore.
-    plat_b.move(1, 0)
+    # Peer revert (chord on B): exactly one local restore.
+    chord(plat_b)
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
     assert ok
     assert plat_a.delegation_calls[base:] == ["controlling", "local"], (
@@ -578,7 +621,7 @@ def test_hand_back_releases_pressed_keys(node_pair_ctx):
     hid = mac_vk_to_hid(0x0F)  # T
     plat_a.press(hid)  # key still held when control is handed back
     wait_injected(plat_b, ("key", hid, True))  # B must apply it before reverting
-    plat_b.move(1, 0)
+    chord(plat_b)  # B reclaims explicitly
     ok = wait_for(
         lambda: pair.a.kvm._state[pair.b.store.fingerprint()] == "local",
         timeout=5,
@@ -593,7 +636,7 @@ def test_remote_rejects_without_consent(node_pair_ctx):
     wait_linked(pair)
     pair.b.store.set_peer_kvm_allowed(pair.a.store.fingerprint(), False)
     fp_b = pair.b.store.fingerprint()
-    plat_a.move(740, 0)
+    chord(plat_a)
     ok = wait_for(lambda: pair.a.kvm._blocked_edge.get(fp_b) is not None, timeout=5)
     assert ok, "A should have been refused"
     assert pair.a.kvm._state.get(fp_b) == "local"
@@ -601,17 +644,16 @@ def test_remote_rejects_without_consent(node_pair_ctx):
     assert plat_b.delegation == "local"
     assert pair.b.kvm._last_request["decision"] == "rejected"
     assert pair.b.kvm._last_request["reason"] == "denied"
-    # the controller edge is blocked while the pointer stays on it: wiggling
-    # must not spam new attempts
-    plat_a.move(1, 0)
-    plat_a.move(-1, 0)
-    assert pair.a.kvm._state.get(fp_b) == "local"
-    # leaving the edge clears the block: a deliberate re-entry is a fresh
-    # attempt that gets refused again
+    # the refusal latch clears once the pointer leaves the seam (mid-screen
+    # here): a fresh chord is answered again and refused again
     plat_a.move(-20, 0)
-    plat_a.move(20, 0)
-    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    ok = wait_for(lambda: pair.a.kvm._blocked_edge.get(fp_b) is None, timeout=5)
+    assert ok, "refusal latch must clear once the pointer leaves the edge"
+    chord(plat_a)
+    ok = wait_for(lambda: pair.b.kvm._last_request["decision"] == "rejected", timeout=5)
     assert ok
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    assert ok, "A must return to local after the second refusal"
     assert plat_b.delegation == "local"
 
 
@@ -621,18 +663,30 @@ def test_denial_deduplicated_until_edge_left(node_pair_ctx):
     pair.b.store.set_peer_kvm_allowed(pair.a.store.fingerprint(), False)
     fp_a = pair.a.store.fingerprint()
     fp_b = pair.b.store.fingerprint()
-    plat_a.move(740, 0)
+    chord(plat_a)
     ok = wait_for(lambda: fp_a in pair.b.kvm._denial_latch, timeout=5)
     assert ok, "target never latched a denial"
-    # pointer stays on the edge: further wiggling must not spam new requests
-    for _ in range(5):
-        plat_a.move(1, 0)
-    assert pair.a.kvm._state.get(fp_b) == "local"
-    # once the pointer leaves the edge, the latch is cleared
+    # while the target's denial latch is set, a repeat request is ignored
+    # (deduplicated), not re-refused
+    chord(plat_a)
+    ok = wait_for(
+        lambda: pair.b.kvm._last_request["decision"] == "ignored"
+        and pair.b.kvm._last_request["reason"] == "denial_latch",
+        timeout=5,
+    )
+    assert ok, "denial must be deduplicated while the latch is set"
+    # no CANCEL comes back for an ignored request: A times out on its own
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=10)
+    assert ok, "ignored request must expire locally"
+    # once the controller's pointer leaves the edge, the edge-left cancel
+    # clears the latch and a fresh chord is refused again
     plat_a.move(-20, 0)
     ok = wait_for(lambda: fp_a not in pair.b.kvm._denial_latch, timeout=5)
     assert ok, "denial latch was never cleared after leaving the edge"
     assert pair.a.kvm._blocked_edge.get(fp_b) is None
+    chord(plat_a)
+    ok = wait_for(lambda: pair.b.kvm._last_request["decision"] == "rejected", timeout=5)
+    assert ok, "fresh request after latch clear must be refused, not ignored"
 
 
 def test_remote_side_change_breaks_takeover(node_pair_ctx):
@@ -647,7 +701,7 @@ def test_remote_side_change_breaks_takeover(node_pair_ctx):
         and pair.b.kvm._topology_ok.get(pair.a.store.fingerprint()) is False
     )
     assert ok
-    plat_a.move(740, 0)
+    chord(plat_a)
     assert pair.a.kvm._state.get(pair.b.store.fingerprint()) != "controlling"
     assert plat_b.delegation == "local"
 
@@ -734,8 +788,12 @@ def test_control_request_decision_records(node_pair_ctx):
 def test_simultaneous_takeover(fp_pair):
     pair, plat_a, plat_b = fp_pair
     wait_linked(pair)
-    plat_a.move(740, 0)  # A parks on its right seam edge -> A requests
-    plat_b.move(-700, 0)  # B parks on its left seam edge -> B requests
+    # both sides press the ownership chord at once: each requests the other
+    for hid in (0x94, 0x96):
+        plat_a.press(hid)
+        plat_b.press(hid)
+    plat_a.press(0x2C)
+    plat_b.press(0x2C)
     fp_b = pair.b.store.fingerprint()  # A's peer / B's own fp
     fp_a = pair.a.store.fingerprint()  # B's peer / A's own fp
 
@@ -797,14 +855,23 @@ def test_escape_chord_reverts_remote(node_pair_ctx):
     assert plat_b.delegation == "local"
 
 
-def test_key_press_on_controlled_device_releases_control(node_pair_ctx):
+def test_key_press_on_controlled_device_does_not_release_control(node_pair_ctx):
+    """Stage 1 explicit ownership: a physical key on the controlled device
+    must NOT end sharing. Only the chord (or lease/disconnect) does."""
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
     take_control(pair, plat_a, plat_b)
     fp_a = pair.a.store.fingerprint()
 
     plat_b.press(mac_vk_to_hid(0x00))  # physical A key on the controlled device
+    time.sleep(0.3)  # give the old auto-revert policy time to (wrongly) fire
+    assert pair.b.kvm._state.get(fp_a) == "remote", "physical key must not revert"
+    assert pair.a.kvm._state.get(pair.b.store.fingerprint()) == "controlling"
+    assert plat_b.delegation == "remote"
+    plat_b.release(mac_vk_to_hid(0x00))
 
+    # the explicit chord on the controlled device still releases
+    chord(plat_b)
     assert wait_for(lambda: pair.b.kvm._state.get(fp_a) == "local", timeout=5)
     assert wait_for(lambda: pair.a.kvm._state.get(pair.b.store.fingerprint()) == "local", timeout=5)
 
@@ -816,7 +883,7 @@ def test_request_timeout_when_target_silent(node_pair_ctx, monkeypatch):
     fp_b = pair.b.store.fingerprint()
     pair.a.kvm.handoff_timeout = 0.3
     monkeypatch.setattr(pair.b.kvm, "_on_control_request", lambda channel, body: None)
-    plat_a.move(740, 0)  # request starts; B never answers
+    chord(plat_a)  # request starts; B never answers
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting")
     assert ok
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
@@ -833,7 +900,7 @@ def test_timeout_while_waiting_active(node_pair_ctx, monkeypatch):
     pair.a.kvm.handoff_timeout = 0.3
     # B never confirms: BEGIN is received but no ACTIVE is sent back
     monkeypatch.setattr(pair.b.kvm, "_on_control_begin", lambda channel, body: None)
-    plat_a.move(740, 0)
+    chord(plat_a)
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "controlling")
     assert ok
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
@@ -871,7 +938,7 @@ def test_stale_ready_ignored(node_pair_ctx):
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
     fp_b = pair.b.store.fingerprint()
-    plat_a.move(740, 0)
+    chord(plat_a)
     ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting")
     assert ok
     pair.a.kvm._on_control_ready(pair.a.kvm._channels[fp_b], __import__("struct").pack(">I", 9999))
@@ -896,12 +963,14 @@ def test_display_change_resyncs(node_pair_ctx):
 
 def raw_kvm_open(host, port, fp, nonce8=None):
     """Open a kvm connection claiming ``fp`` (does not complete the handshake)."""
+    from core.kvm import KVM_PROTOCOL_VERSION
+
     sock = socket.create_connection((host, port), timeout=5)
     send_frame(
         sock,
         {
             "type": "kvm_open",
-            "v": 1,
+            "v": KVM_PROTOCOL_VERSION,
             "fp": fp,
             "nonce8": base64.b64encode(nonce8 or os.urandom(8)).decode("ascii"),
         },
@@ -1133,7 +1202,8 @@ def test_run_loop_survives_handler_exception(tmp_path, monkeypatch):
     engine._channels[fp] = channel
     channel.conn = LiveDummyConn()
     engine.stall_timeout = 60.0
-    plain = bytes([KIND_CONTROL_REQUEST]) + encode_control_request(1, 0, 0, 0)
+    body = encode_control_request(1, 0, 0, 0)
+    plain = pack_frame(0, 0, KIND_CONTROL_REQUEST, body)
     raw0 = crypto.encrypt_with_nonce(channel.key, crypto.chunk_nonce(channel.nonce8_in, 0), plain)
     raw1 = crypto.encrypt_with_nonce(channel.key, crypto.chunk_nonce(channel.nonce8_in, 1), plain)
     frames = iter([raw0, raw1])
@@ -1180,10 +1250,13 @@ def test_f1_send_failure_tears_down_session(tmp_path):
         "mask": 0,
         "fraction": None,
         "parked": False,
+        "peer_last_seen": time.monotonic(),
+        "lease_deadline": None,
     }
     engine._channels[fp] = channel
+    engine.enabled = True  # on_escape_chord checks the enabled flag
 
-    engine.on_remote_local_input(origin="test")
+    engine.on_escape_chord()  # release path on a dead socket
 
     ok = wait_for(lambda: channel.closed, timeout=5)
     assert ok, "send failure must close the channel"
@@ -1231,6 +1304,46 @@ def test_f2_delegation_failure_surfaces_and_restarts_capture(tmp_path):
     assert engine._state.get(fp) == "local"
 
 
+def test_platform_input_lost_reverts_remote_session(tmp_path):
+    """When the platform's input capture dies (macOS tap disabled), the
+    peer must not believe it still owns this Mac: the session is reverted,
+    delegation restored, and the peer told."""
+    fp = "capture-dead-peer"
+    engine, channel, toasts = make_stuck_engine(tmp_path, fp, consent=True)
+    platform = FakePlatform("DeadScreen")
+    engine.platform = platform
+    engine._state[fp] = "remote"
+    engine._handoffs[fp] = {
+        "id": 9,
+        "role": "target",
+        "stage": "active",
+        "deadline": None,
+        "entry": (48, 540),
+        "mask": 0,
+        "fraction": None,
+        "parked": False,
+    }
+    engine._channels[fp] = channel
+    live = LiveDummyConn()
+    channel.conn = live
+
+    engine.on_platform_input_lost()
+
+    assert engine._state.get(fp) == "local"
+    assert platform.delegation == "local"
+    ok = wait_for(lambda: len(live.sent) >= 2, timeout=5)
+    assert ok, "revert + all-keys-up must reach the peer"
+    kinds = []
+    for i, frame in enumerate(live.sent):
+        length = struct.unpack(">I", frame[:4])[0]
+        nonce = crypto.chunk_nonce(channel.nonce8_out, i)
+        plain = crypto.decrypt_with_nonce(channel.key, nonce, frame[4 : 4 + length])
+        kinds.append(unpack_frame(plain)[2])
+    assert KIND_CONTROL_REVERT in kinds
+    assert KIND_ALL_KEYS_UP in kinds
+    assert any("Control taken back" in m for m, _ in toasts)
+
+
 def test_f3_waiting_active_label_and_transition_log(node_pair_ctx):
     pair, plat_a, plat_b = node_pair_ctx
     wait_linked(pair)
@@ -1276,9 +1389,9 @@ def test_f4_concurrent_callback_and_reader_traffic(node_pair_ctx):
     assert pair.b.kvm.control_state(pair.a.store.fingerprint()) == "local"
 
 
-def test_f5_local_input_revert_reports_origin(node_pair_ctx):
-    """F5: reverts must say which local input path triggered them, so a
-    stuck "input on the target" episode is diagnosable.  The origin is
+def test_f5_revert_origin_reported_to_controller(node_pair_ctx):
+    """F5: reverts must say which path triggered them, so a stuck
+    "control on the target" episode is diagnosable.  The origin is
     generated on the target and must reach the controller's status line
     over the wire."""
     pair, plat_a, plat_b = node_pair_ctx
@@ -1286,10 +1399,9 @@ def test_f5_local_input_revert_reports_origin(node_pair_ctx):
     take_control(pair, plat_a, plat_b)
     toasts = []
     pair.a.kvm.on_status = lambda m, level="info": toasts.append((m, level))
-    pair.b.kvm._capture_origin = "mac"
-    plat_b.move(10, 0)
-    ok = wait_for(lambda: any("physical mouse moved" in m for m, _ in toasts))
-    assert ok, f"pointer origin missing from controller toasts: {toasts}"
+    chord(plat_b)  # explicit release on the target
+    ok = wait_for(lambda: any("escape" in m for m, _ in toasts))
+    assert ok, f"escape origin missing from controller toasts: {toasts}"
     assert pair.a.kvm.control_state(pair.b.store.fingerprint()) == "local"
     assert pair.b.kvm.control_state(pair.a.store.fingerprint()) == "local"
     ok = wait_for(lambda: pair.a.kvm.control_state(pair.b.store.fingerprint()) == "local", timeout=5)
@@ -1299,10 +1411,6 @@ def test_f5_local_input_revert_reports_origin(node_pair_ctx):
     # a fresh takeover needs a deliberate exit of the latch zone first.
     plat_a.move(-700, 0)  # (1435, 450) -> (735, 450): clearly off the seam
     take_control(pair, plat_a, plat_b)
-    pair.b.kvm._capture_origin = "win"
-    plat_b.press(mac_vk_to_hid(0x00))
-    ok = wait_for(lambda: any("physical keyboard input" in m for m, _ in toasts))
-    assert ok, f"key origin missing from controller toasts: {toasts}"
 
 
 def test_f7_keyboard_stall_escalation_and_recovery(tmp_path):
@@ -1376,11 +1484,12 @@ def test_f8_rel_coalescing_and_control_priority(tmp_path):
         (size,) = struct.unpack(">I", raw[:4])
         frames.append(crypto.decrypt_with_nonce(channel.key, crypto.chunk_nonce(channel.nonce8_out, len(frames)), raw[4 : 4 + size]))
 
-    kinds = [f[0] for f in frames]
+    kinds = [unpack_frame(f)[2] for f in frames]
     assert kinds[0] == KIND_KEY_DOWN, f"control frame must go first: {kinds}"
     assert kinds[1] == KIND_MOUSE_MOVE_REL, f"moves must coalesce after: {kinds}"
     assert len(frames) == 2, f"3 rel moves must collapse into 1 frame: {frames}"
-    dx, dy = struct.unpack(">hh", frames[1][1:])
+    _, _, _, body = unpack_frame(frames[1])
+    dx, dy = struct.unpack(">hh", body)
     assert (dx, dy) == (6, 18), f"coalesced deltas wrong: {(dx, dy)}"
 
 
@@ -1453,7 +1562,7 @@ def test_p1_overflow_split_keeps_writer_alive(tmp_path):
     engine, channel, toasts = make_stuck_engine(tmp_path, fp, consent=True)
     conn = LiveDummyConn()
     channel.conn = conn
-    channel._dataq.append(("rel", 200000, -100000))
+    channel._dataq.append(("rel", 200000, -100000, 0))
     with channel._sendcv:
         channel._sendcv.notify_all()
 
@@ -1470,8 +1579,9 @@ def test_p1_overflow_split_keeps_writer_alive(tmp_path):
 
     dx = dy = 0
     for f in frames:
-        assert f[0] == KIND_MOUSE_MOVE_REL
-        cdx, cdy = struct.unpack(">hh", f[1:])
+        _, _, kind, body = unpack_frame(f)
+        assert kind == KIND_MOUSE_MOVE_REL
+        cdx, cdy = struct.unpack(">hh", body)
         assert -32767 <= cdx <= 32767 and -32767 <= cdy <= 32767, (cdx, cdy)
         dx += cdx
         dy += cdy

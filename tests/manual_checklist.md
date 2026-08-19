@@ -101,37 +101,46 @@ not on PATH: `py -3.12 -m PyInstaller ...`.
 macOS injection needs Accessibility permission (System Settings →
 Privacy & Security → Accessibility); the app toasts when it is missing.
 
+Control is **explicit**: the escape chord (Ctrl+Option+Space on macOS,
+Ctrl+Alt+Space on Mac control of Windows) both takes control of the
+single ready peer and releases it again. The edge-seam auto-takeover is
+disabled by default (`edge_handoff_enabled = False`); physical input on
+the controlled device never takes control back — only the chord, lease
+expiry (6 s), or disconnect do.
+
 - [ ] Enable sharing on A and B: check "Mouse & keyboard sharing"
 - [ ] On B: menu → "Mouse & keyboard devices…" → A's device entry → check
       "Allow this device to control this Mac"
 - [ ] Both sides set the seam: A's entry on B says "Right", B's entry on
       A says "Left" (defaults; adjust if your screens are laid out
-      differently)
-- [ ] Move the cursor past A's right edge → A's cursor is parked and
-      hidden at the seam and the peer shows "ready"; only after B
-      confirms is A's input suppressed ("controlling" toast) and B's
-      cursor jumps to the mirrored position
+      differently — the topology check still validates this at request
+      time)
+- [ ] Press Ctrl+Option+Space on A → A shows "controlling" (input
+      suppressed only after B confirms) and B's cursor jumps to its
+      screen center (the explicit entry point)
 - [ ] Type and scroll on A → input appears on B; B's clipboard / focus
       follow the shared cursor
 - [ ] Check the tray menu on B during takeover → B's entry under "Mouse &
       keyboard devices…" shows "controlled by peer"; on A it shows
       "controlling"
-- [ ] Move the physical mouse, click, or scroll on B → control returns to B,
-      cursor reappears on A parked just inside the seam
+- [ ] Positive (explicit ownership): while A controls B, move the
+      physical mouse, click, or scroll on B → control is NOT released;
+      B's cursor stays where the forwarded input puts it
 - [ ] Negative: while controlling, your keyboard input still reaches B
       instantly, but A's own mouse stops working (suppressed) only after
       the takeover was confirmed — no blind grabs
-- [ ] Take control again, press the escape chord (Ctrl+Option+Space on
-      macOS, Ctrl+Alt+Space on Mac control of Windows) → control returns
-- [ ] Escape chord on the *controlled* machine also forces control back
-- [ ] Negative: with "Allow control" OFF on B, moving past A's right
-      edge does not take control and B shows a "refused" toast; moving
-      away from the edge and back only ever announces it once per edge
-      dwell
-- [ ] Negative: disconnect A from the network mid-takeover → B regains
-      local control and no stuck keys remain
-- [ ] Negative: while A controls B, move a third paired device C (consent
-      on) onto B's edge → B shows a "busy" error toast, and once A hands
+- [ ] Press the escape chord again on A → control returns to B, A's
+      cursor reappears parked just inside the seam
+- [ ] Escape chord on the *controlled* machine (B) also forces control
+      back
+- [ ] Lease expiry: while A controls B, kill the A app (or cut the
+      network) → B regains local control on its own within ~6 s and no
+      stuck keys remain
+- [ ] Negative: with "Allow control" OFF on B, pressing the chord on A
+      does not take control and B shows a "refused" toast once; the
+      refusal latch clears when the pointer leaves the edge
+- [ ] Negative: while A controls B, a third paired device C (consent on)
+      presses its chord → C shows a "busy" error toast, and once A hands
       back, C can take over immediately (no frozen state)
 - [ ] Negative: revoke Accessibility from the app mid-takeover → a key
       press on A degrades without killing the session; restoring the
@@ -165,17 +174,16 @@ diagnostics), plus edge latches (`blocked_edges`) and transition reasons.
       - Expected: engine `state=controlling`, `platform.mode=controlling`,
         `assoc_false == 1`, `assoc_true == 0` while active, and no
         `set_delegation("local")`/True association until revert.
-- [ ] Handback latch (Problem B): with A controlling B, wiggle B's physical
-      mouse → both devices become local; A's menu shows "local" and A does
-      NOT immediately re-take B even though A's cursor sits near the seam;
-      A must move clearly away from the edge and back to take control again.
-      Check `blocked_edges` shows A's side latched right after the revert
-      and empty after A's cursor left the latch zone.
-- [ ] B then moves its own mouse to its edge and controls A (the
-      former-controller latch must not block the new direction).
-- [ ] Regression: escape chord (Ctrl+Option+Space), channel loss mid-
-      takeover, and repeated deliberate edge handoffs all still behave as
-      in section 9.
+- [ ] Handback after chord: with A controlling B, press the chord on A →
+      both devices become local; A's menu shows "local" and A does NOT
+      immediately re-take B from residual motion; the takeover requires a
+      fresh chord press.
+- [ ] B then presses its own chord and controls A (both directions
+      work; the reverse direction must not be blocked by A's revert
+      latch).
+- [ ] Regression: escape chord, channel loss mid-takeover, and lease
+      expiry (kill A's app while it controls B) all return both sides to
+      local as in section 9.
 
 ## 9c. KVM regression check — held keys, jitter, reverse direction
 
@@ -199,9 +207,8 @@ stream (control taken/released on both sides, refusals with reasons);
 - [ ] Log book: Mac controls Windows → Mac's log book shows
       "Took control of <Windows>"; Windows' shows "<Mac> took control of
       this device".
-- [ ] Revert with reason: Windows physical mouse moves → both log books
-      show the release with "physical mouse moved on the controlled
-      device"; escape chord shows the chord reason.
+- [ ] Revert with reason: press the chord on the controller → both log
+      books show the release with the escape-chord reason.
 - [ ] Held keys repeat (Regression 1): Mac controls Windows, hold
       Backspace → characters delete repeatedly (Windows does not
       auto-repeat SendInput, the Mac forwards autorepeat events now).
@@ -210,24 +217,23 @@ stream (control taken/released on both sides, refusals with reasons);
       the Windows cursor is smooth, no flicker, no "Released control"
       toast; Windows' `reverts_sent` stays 0 and `request_log` shows no
       new request mid-stream.
-- [ ] Windows physical reclaim: while Mac controls Windows, move the
-      Windows mouse → both become local, `revert_log` shows
-      `accepted` then `completed state=local` on the Mac.
-- [ ] Mac re-take after handback (Regression 3 fix): after Windows
-      reclaims, move the Mac cursor straight to the edge again (no need
-      to pull it away first) → Mac takes control again once the 2 s
-      grace has passed.
-- [ ] Reverse direction (Windows controls Mac): with the Windows cursor
-      away from its edge, cross Windows' seam once → Windows controls
-      the Mac; Mac's `last_request` decision is `accepted` even while its
-      former-controller edge latch is set (`blocked_edges` non-empty).
-      If it fails, read `last_request` / `request_log` on the Mac:
-      `rejected reason=denied` (consent off) vs `topology` (seam
-      mismatch) vs `busy` (stuck active handoff) vs `unavailable` /
-      `closed` (no platform / channel) vs nothing at all (Windows never
-      sent: check Windows' own `last_request` for `busy`/`denied`).
-- [ ] Regression: escape chord, channel loss, and repeated deliberate
-      edge handoffs still behave as in section 9.
+- [ ] Chord reclaim: while Mac controls Windows, press the chord on
+      Windows → both become local, `revert_log` shows `accepted` then
+      `completed state=local` on the Mac.
+- [ ] Mac re-take after handback: after Windows reclaims, press the chord
+      on the Mac again → Mac controls Windows once more (the revert
+      grace never blocks a deliberate chord takeover).
+- [ ] Reverse direction (Windows controls Mac): Windows presses its chord
+      → Windows controls the Mac; Mac's `last_request` decision is
+      `accepted` even while its former-controller edge latch is set
+      (`blocked_edges` non-empty). If it fails, read `last_request` /
+      `request_log` on the Mac: `rejected reason=denied` (consent off)
+      vs `topology` (seam mismatch) vs `busy` (stuck active handoff) vs
+      `unavailable` / `closed` (no platform / channel) vs nothing at all
+      (Windows never sent: check Windows' own `last_request` for
+      `busy`/`denied`).
+- [ ] Regression: escape chord, channel loss, and lease expiry still
+      behave as in section 9.
 
 ## 10. Keyboard & mouse sharing (KVM) — Windows
 
