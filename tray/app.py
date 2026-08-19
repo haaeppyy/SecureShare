@@ -993,6 +993,11 @@ class TrayApp:
                             partial(self._toggle_kvm_allowed, fp),
                             checked=partial(self._peer_kvm_allowed, fp),
                         ),
+                        pystray.MenuItem(
+                            self._kvm_takeover_label(fp),
+                            self._kvm_takeover_click(fp),
+                            enabled=self._kvm_takeover_enabled(fp),
+                        ),
                         pystray.Menu.SEPARATOR,
                         pystray.MenuItem(
                             f"This device is on this side of {self._node_name()}",
@@ -1011,6 +1016,38 @@ class TrayApp:
                 *peer_items,
             ),
         )
+
+    def _kvm_takeover_label(self, fp):
+        """Menu-driven control toggle: one state-aware action per device."""
+        status = self._peer_kvm_status(fp)
+
+        def label(item=None):
+            current = self._peer_kvm_status(fp)
+            if current == "controlling" or current == "waiting for peer":
+                return "Release control of this device…"
+            if current == "controlled by peer":
+                return "Give control back to this device"
+            return "Take control of this device"
+        return label
+
+    def _kvm_takeover_enabled(self, fp):
+        def enabled(item=None):
+            status = self._peer_kvm_status(fp)
+            if status in ("controlling", "waiting for peer", "controlled by peer"):
+                return True
+            return status == "ready"
+        return enabled
+
+    def _kvm_takeover_click(self, fp):
+        def click(icon, item):
+            status = self._peer_kvm_status(fp)
+            if status == "controlling" or status == "waiting for peer":
+                self.node.kvm.release_control(fp)
+            elif status == "controlled by peer":
+                self.node.kvm.release_control(fp)
+            else:
+                self.node.kvm.request_control(fp)
+        return click
 
     def _peer_kvm_status(self, fp, item=None):
         """Per-peer KVM state. Link and control are separate on purpose."""

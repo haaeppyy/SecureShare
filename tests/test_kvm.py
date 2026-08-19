@@ -1641,3 +1641,100 @@ def test_p1_no_keys_grace_and_single_tap_restart(tmp_path):
 
 
 pytestmark = pytest.mark.socket
+
+# -- menu-driven control toggle (tray action) --------------------------------
+
+
+def test_menu_request_control_drives_full_handoff(node_pair_ctx):
+    """The tray action routes through the same acknowledged handoff as the
+    chord; the entry point lands on the peer's screen center."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    layout = pair.b.kvm.platform.screen_layout()
+    pair.a.kvm.request_control(fp_b)
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting")
+    assert ok, "A never entered requesting"
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "controlling")
+    assert ok, "A never got controlling"
+    ok = wait_for(lambda: pair.b.kvm._state.get(pair.a.store.fingerprint()) == "remote")
+    assert ok, "B never entered remote"
+    ok = wait_for(lambda: pair.a.kvm.platform.delegation == "controlling")
+    assert ok, "A never suppressed input (ACTIVE never arrived)"
+    rec = pair.a.kvm._handoffs.get(fp_b)
+    assert rec is not None and rec.get("fraction") == 0.5
+    assert rec.get("entry") == (
+        layout.left() + layout.width() // 2,
+        layout.top() + layout.height() // 2,
+    )
+    assert pair.b.kvm._last_request["decision"] == "accepted"
+
+
+def test_menu_release_control_hands_back(node_pair_ctx):
+    """Controller-side menu release: wire reason is 'user' (menu), not
+    'escape' (chord), and the edge latch is set like any revert."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    pair.a.kvm.release_control(fp_b)
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    assert ok, "A never handed back control"
+    ok = wait_for(lambda: pair.b.kvm._state.get(pair.a.store.fingerprint()) == "local")
+    assert ok, "B never returned to local"
+    assert pair.a.kvm.platform.delegation == "local"
+    assert pair.a.kvm._blocked_edge.get(fp_b) == "right"
+    reasons = [t[5] for t in pair.a.kvm.recent_transitions() if t[1] == fp_b and t[5]]
+    assert any("user" in r for r in reasons), reasons
+    assert not any("escape" in r for r in reasons), reasons
+
+
+def test_target_menu_give_back_ends_session(node_pair_ctx):
+    """Target-side menu action ('give control back') must tear the session
+    down from the controlled device."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    pair.b.kvm.release_control(pair.a.store.fingerprint())
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "local", timeout=5)
+    assert ok, "A never returned to local"
+    ok = wait_for(lambda: pair.b.kvm._state.get(pair.a.store.fingerprint()) == "local")
+    assert ok, "B never returned to local"
+    assert pair.b.kvm.platform.delegation == "local"
+
+
+def test_menu_request_control_refusals(node_pair_ctx):
+    """Menu takeover refuses cleanly: unknown peer, and while a session is
+    already active."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    toasts = []
+    pair.a.kvm.on_status = lambda s, level="info": toasts.append(s)
+    pair.a.kvm.request_control("deadbeefdeadbeef")
+    assert "deadbeefdeadbeef" not in pair.a.kvm._handoffs
+    assert any("no channel" in s for s in toasts), toasts
+    fp_b = pair.b.store.fingerprint()
+    take_control(pair, plat_a, plat_b)
+    toasts.clear()
+    pair.a.kvm.request_control(fp_b)
+    assert pair.a.kvm._state.get(fp_b) == "controlling", "busy request must not disturb the session"
+    assert any("finish the current session" in s for s in toasts), toasts
+
+
+def test_chord_fires_with_right_option(node_pair_ctx):
+    """Ctrl + right-Option + Space must arm the escape chord (right
+    Option maps to ALTGR on both platforms)."""
+    pair, plat_a, plat_b = node_pair_ctx
+    wait_linked(pair)
+    fp_b = pair.b.store.fingerprint()
+    for hid in (0x94, 0x9A):  # left ctrl + right alt/option
+        plat_a.press(hid)
+    plat_a.press(0x2C)
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "requesting")
+    assert ok, "Ctrl+right-Option+Space never requested control"
+    plat_a.release(0x2C)
+    for hid in (0x94, 0x9A):
+        plat_a.release(hid)
+    ok = wait_for(lambda: pair.a.kvm._state.get(fp_b) == "controlling")
+    assert ok, "handoff did not complete"

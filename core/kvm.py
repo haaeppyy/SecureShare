@@ -168,6 +168,7 @@ def _friendly_reason(reason: str) -> str:
         "peer-edge": "cursor reached the edge on the controlled device",
         "escape": "escape chord (Ctrl+Option+Space) pressed",
         "escape chord": "escape chord (Ctrl+Option+Space) pressed",
+        "user": "released from the device menu",
         "handoff timeout": "handoff timed out",
         "peer refused": "the controlled device refused",
         "layout mismatch": "screen layout mismatch",
@@ -1373,10 +1374,14 @@ class KVMEngine:
             self._local_mask &= ~bit
 
     def _check_chord(self) -> None:
-        from .kvm_keymap import MOD_ALT, MOD_CTRL
+        from .kvm_keymap import MOD_ALT, MOD_ALTGR, MOD_CTRL
 
-        combo = MOD_CTRL | MOD_ALT
-        if self._local_mask & combo != combo:
+        # Right Alt/Option maps to ALTGR on both platforms (macOS: right
+        # Option; Windows: AltGr). The chord must accept either modifier
+        # as the "Alt" half, or a right-Option press could never arm it.
+        if (self._local_mask & MOD_CTRL) != MOD_CTRL or not (
+            self._local_mask & (MOD_ALT | MOD_ALTGR)
+        ):
             self._chord_armed = True
             return
         if 0x2C in self._local_pressed and self._chord_armed:
@@ -1402,63 +1407,109 @@ class KVMEngine:
             channel.send_event(KIND_CONTROL_REVERT, encode_handoff_message(rec["id"], "peer-edge"))
             self._revert_remote(channel, "peer edge", origin="peer-edge")
 
+    def _ready_channels(self) -> list:
+        """Channels of peers that can accept control right now (local
+        state + linked + layouts exchanged + topology verified)."""
+        return [
+            ch
+            for fp, ch in self._channels.items()
+            if self._state.get(fp, STATE_LOCAL) == STATE_LOCAL and self._link_ready(fp)
+        ]
+
+    def request_control(self, fp: str) -> None:
+        """Menu takeover: request control of one specific ready peer.
+
+        The target still runs its full decision matrix (consent,
+        topology, busy, platform). The cursor lands on the peer's screen
+        center (fraction 0.5).
+        """
+        if not self.enabled:
+            return
+        with self._lock:
+            channel = self._channels.get(fp)
+            if channel is None:
+                self.on_status("KVM: no channel to that device", level="error")
+                return
+            if any(st != STATE_LOCAL for st in self._state.values()):
+                self.on_status("KVM: finish the current session first", level="error")
+                return
+            if not self._link_ready(fp):
+                self.on_status(f"KVM: {channel.peer_name} is not ready", level="error")
+                return
+            layout = self._peer_layouts.get(fp)
+            if layout is None:
+                self.on_status(f"KVM: {channel.peer_name} has no layout yet", level="error")
+                return
+            self._request_control(
+                channel,
+                layout.left() + layout.width() // 2,
+                layout.top() + layout.height() // 2,
+                0.5,
+            )
+
+    def release_control(self, fp: str, reason: str = "user release", origin: str = "user") -> None:
+        """Menu release: end the active session with one peer (we are the
+        controller or the target).
+
+        ``origin`` is the reason that travels on the wire to the peer;
+        ``reason`` feeds the local revert log and status line.
+        """
+        if not self.enabled:
+            return
+        with self._lock:
+            channel = self._channels.get(fp)
+            if channel is None:
+                return
+            state = self._state.get(fp, STATE_LOCAL)
+            if state not in (
+                STATE_CONTROLLING,
+                STATE_REQUESTING,
+                STATE_REMOTE,
+                STATE_REMOTE_PREPARING,
+            ):
+                return
+            rec = self._handoffs.get(fp)
+            if rec is None:
+                return
+            try:
+                channel.send_event(KIND_CONTROL_REVERT, encode_handoff_message(rec["id"], origin))
+            except Exception:
+                pass
+            if state in (STATE_REMOTE, STATE_REMOTE_PREPARING):
+                self._revert_remote(channel, reason, origin=origin)
+            else:
+                # Same protection as a peer-driven revert: the cursor is
+                # restored just inside the seam, so latch the edge until
+                # the pointer clearly leaves it.
+                self._blocked_edge[fp] = self._my_side_for(fp)
+                self._revert_control(channel, reason, origin=origin)
+
     def on_escape_chord(self) -> None:
-        """Ownership toggle (Ctrl+Alt+Space / Ctrl+Option+Space).
+        """Emergency release / takeover toggle (Ctrl+Alt+Space).
 
         With a session, it forces local release. Without one, it requests
-        control of the single ready peer - explicit ownership replaces the
-        auto-seam handoff (review Stage 1). With several peers ready a
-        picker is required, so we refuse rather than guess.
+        control of the single ready peer (explicit ownership). With
+        several peers ready a picker would be required, so it refuses
+        rather than guess - the per-device menu is the primary path.
         """
         if not self.enabled:
             return
         with self._lock:
             channel = self._active_channel()
-            if channel is not None:
-                fp = channel.peer_fp
-                state = self._state.get(fp, STATE_LOCAL)
-                rec = self._handoffs.get(fp)
-                if rec is None:
-                    return
-                if state in (STATE_CONTROLLING, STATE_REQUESTING, STATE_REMOTE, STATE_REMOTE_PREPARING):
-                    try:
-                        channel.send_event(KIND_CONTROL_REVERT, encode_handoff_message(rec["id"], "escape"))
-                    except Exception:
-                        pass
-                    if state in (STATE_REMOTE, STATE_REMOTE_PREPARING):
-                        self._revert_remote(channel, "escape chord", origin="escape")
-                    else:
-                        # Same protection as a peer-driven revert: the cursor is
-                        # restored just inside the seam, so latch the edge until
-                        # the pointer clearly leaves it.
-                        self._blocked_edge[fp] = self._my_side_for(fp)
-                        self._revert_control(channel, "escape chord", origin="escape")
-                return
-            ready = [
-                ch
-                for fp, ch in self._channels.items()
-                if self._state.get(fp, STATE_LOCAL) == STATE_LOCAL and self._link_ready(fp)
-            ]
-            if not ready:
-                self.on_status("KVM: no connected peer to take control of", level="error")
-                return
-            if len(ready) > 1:
-                self.on_status(
-                    "KVM: several peers ready - peer selection is not implemented yet",
-                    level="error",
-                )
-                return
-            ch = ready[0]
-            layout = self._peer_layouts.get(ch.peer_fp)
-            if layout is None:
-                self.on_status(f"KVM: {ch.peer_name} has no layout yet", level="error")
-                return
-            self._request_control(
-                ch,
-                layout.left() + layout.width() // 2,
-                layout.top() + layout.height() // 2,
-                0.5,
+        if channel is not None:
+            self.release_control(channel.peer_fp, reason="escape chord", origin="escape")
+            return
+        ready = self._ready_channels()
+        if not ready:
+            self.on_status("KVM: no connected peer to take control of", level="error")
+            return
+        if len(ready) > 1:
+            self.on_status(
+                "KVM: several peers ready - peer selection is not implemented yet",
+                level="error",
             )
+            return
+        self.request_control(ready[0].peer_fp)
 
     def on_display_change(self) -> None:
         if not self.enabled or self.platform is None:

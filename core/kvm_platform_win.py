@@ -177,6 +177,7 @@ class WindowsInputPlatform:
         self._cursor_hidden = False
         self._send_input_failures = 0
         self._last_send_input_error = 0.0
+        self._first_exception = None
         if _WIN_OK:
             try:
                 ctypes.windll.user32.SetProcessDPIAware()
@@ -233,13 +234,50 @@ class WindowsInputPlatform:
     def _hook_main(self) -> None:
         # Keep strong references: pywin32 does not hold the callback, and a
         # garbage-collected proc makes the hook silently dead.
-        self._mouse_proc = self._make_mouse_proc()
-        self._kbd_proc = self._make_kbd_proc()
-        self._hook_ids = [
-            win32gui.SetWindowsHookEx(WH_MOUSE_LL, self._mouse_proc, None, 0),
-            win32gui.SetWindowsHookEx(WH_KEYBOARD_LL, self._kbd_proc, None, 0),
-        ]
-        win32gui.PumpMessages()
+        try:
+            self._mouse_proc = self._make_mouse_proc()
+            self._kbd_proc = self._make_kbd_proc()
+            hooks = [
+                win32gui.SetWindowsHookEx(WH_MOUSE_LL, self._mouse_proc, None, 0),
+                win32gui.SetWindowsHookEx(WH_KEYBOARD_LL, self._kbd_proc, None, 0),
+            ]
+            if not all(hooks):
+                raise WindowsPlatformError(
+                    f"SetWindowsHookEx failed (handles: {[h for h in hooks]})"
+                )
+            self._hook_ids = hooks
+            win32gui.PumpMessages()
+        except Exception as exc:
+            self._note_exception(exc)
+
+    def _note_exception(self, exc: Exception) -> None:
+        """Surface a hook-thread failure instead of dying silently.
+
+        The previous behaviour left a dead hook thread with no trace: the
+        app ran, the engine believed input capture was alive, and KVM
+        silently did nothing (diagnostics showed hook_thread_alive False).
+        """
+        engine = self.engine
+        if engine is None:
+            return
+        first = False
+        with self._lock:
+            if self._first_exception is None:
+                self._first_exception = f"{type(exc).__name__}: {exc}"
+                first = True
+        if first:
+            try:
+                engine.on_platform_input_lost()
+            except Exception:
+                pass
+            try:
+                engine.on_status(
+                    f"KVM: input capture failed on this device ({self._first_exception}) - "
+                    "see diagnostics for details",
+                    level="error",
+                )
+            except Exception:
+                pass
 
     def _make_mouse_proc(self):
         def mouse_proc(nCode, wParam, lParam):
@@ -414,6 +452,7 @@ class WindowsInputPlatform:
                 "ignore_warps": len(self._ignore_warps),
                 "send_input_failures": self._send_input_failures,
                 "cursor_hidden": self._cursor_hidden,
+                "first_exception": self._first_exception,
             }
 
     # -- geometry -----------------------------------------------------------------
