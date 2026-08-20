@@ -1132,6 +1132,7 @@ class KVMEngine:
             return
         channel.send_event(KIND_CONTROL_BEGIN, encode_handoff_id(hid))
         self.on_status(f"Controlling {channel.peer_name}")
+        self.on_status(f"KVM: takeover of {channel.peer_name} accepted (id={hid})", level="error")
 
     def _on_control_active(self, channel: KvmChannel, body: bytes) -> None:
         try:
@@ -1152,6 +1153,7 @@ class KVMEngine:
             self._fail_controller(channel, rec, "platform", f"platform failure: {exc}")
             return
         self.on_status(f"Control active with {channel.peer_name}")
+        self.on_status(f"KVM: control ACTIVE with {channel.peer_name} (id={hid})", level="error")
 
     def _on_control_begin(self, channel: KvmChannel, body: bytes) -> None:
         try:
@@ -1178,6 +1180,7 @@ class KVMEngine:
             return
         channel.send_event(KIND_CONTROL_ACTIVE, encode_handoff_id(hid))
         self.on_status(f"{channel.peer_name} controls this device")
+        self.on_status(f"KVM: control ACTIVE with {channel.peer_name} (id={hid})", level="error")
 
     # -- handoff: target side --------------------------------------------------
 
@@ -1234,14 +1237,19 @@ class KVMEngine:
         }
         self._state[fp] = STATE_REMOTE_PREPARING
         channel.send_event(KIND_CONTROL_READY, encode_handoff_id(hid))
+        self.on_status(
+            f"KVM: {channel.peer_name} takeover accepted (id={hid})", level="error"
+        )
 
     def _refuse(self, channel: KvmChannel, hid: int, reason: str, message: str = "") -> None:
         try:
             channel.send_event(KIND_CONTROL_CANCEL, encode_handoff_message(hid, reason))
         except Exception:
             pass
-        if message:
-            self.on_status(f"KVM: {message}", level="error")
+        self.on_status(
+            f"KVM: refused {channel.peer_name} takeover ({reason}) - {message or 'see layout/consent settings'}",
+            level="error",
+        )
 
     # -- handoff: cancellation / revert (both roles) ---------------------------
 
@@ -1327,6 +1335,7 @@ class KVMEngine:
         channel.send_event(KIND_ALL_KEYS_UP)
         self._state[fp] = STATE_LOCAL
         self.on_status(f"Control returned from {channel.peer_name} ({reason})")
+        self.on_status(f"KVM: control reverted (controller, {reason})", level="error")
 
     def _revert_remote(self, channel: KvmChannel, reason: str) -> None:
         if channel is None:
@@ -1348,6 +1357,7 @@ class KVMEngine:
         self._release_all_keys()
         self._state[fp] = STATE_LOCAL
         self.on_status(f"{channel.peer_name} released control ({reason})")
+        self.on_status(f"KVM: control reverted (remote, {reason})", level="error")
 
     def _restore_controller_cursor(self, fp: str, fraction) -> None:
         """Warp back to my seam edge, inset past the jump zone so the

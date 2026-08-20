@@ -203,6 +203,8 @@ class WindowsInputPlatform:
         # Recent untaggable SetCursorPos moves. A single slot races when the
         # hook queue receives a burst of remote cursor updates.
         self._ignore_warps = deque()
+        self._edge_hits = 0
+        self._layout_cache = None  # (monotonic ts, ScreenLayout)
         self._pressed = set()
         self._virtual = None  # virtual-desktop pixel bounds (l, t, r, b)
         if _WIN_OK:
@@ -377,6 +379,16 @@ class WindowsInputPlatform:
         with self._lock:
             self._mode = state
 
+    def diagnostics(self) -> dict:
+        with self._lock:
+            return {
+                "family": "win",
+                "mode": self._mode,
+                "hook_thread_alive": bool(self._hook_thread and self._hook_thread.is_alive()),
+                "ignore_warps": len(self._ignore_warps),
+                "edge_hits": self._edge_hits,
+            }
+
     # -- geometry -----------------------------------------------------------------
 
     def _refresh_virtual_bounds(self) -> None:
@@ -393,13 +405,21 @@ class WindowsInputPlatform:
     def screen_layout(self) -> ScreenLayout:
         if not _WIN_OK:
             raise WindowsPlatformError("pywin32 unavailable")
+        now = time.monotonic()
+        with self._lock:
+            cached = self._layout_cache
+            if cached is not None and now - cached[0] < 0.5:
+                return cached[1]
         self._refresh_virtual_bounds()
         monitors = []
         for hmon, _, rect in win32api.EnumDisplayMonitors():
             scale = self._monitor_scale(hmon)
             x, y, r, b = rect
             monitors.append(Monitor(x, y, r - x, b - y, scale))
-        return ScreenLayout(monitors, primary=0)
+        layout = ScreenLayout(monitors, primary=0)
+        with self._lock:
+            self._layout_cache = (time.monotonic(), layout)
+        return layout
 
     def _monitor_scale(self, hmon) -> float:
         try:
@@ -475,8 +495,32 @@ class WindowsInputPlatform:
     # -- injection -----------------------------------------------------------------
 
     def inject_move_rel(self, dx: int, dy: int) -> None:
-        x, y = self.cursor_position()
-        self.inject_move_abs(x + dx, y + dy)
+        """True relative injection, tagged with the SENTINEL.
+
+        The hooks must never be able to mistake an injected move for
+        physical input: a sentineless SetCursorPos warp only survives if
+        the hook's ignore-queue matches it exactly (and in time), so a
+        burst of remote deltas can miss and be treated as local input -
+        which instantly reverts control on the remote side. Relative
+        SendInput with the sentinel is unambiguous by construction.
+        """
+        if not dx and not dy:
+            return
+        _send_input(
+            [
+                INPUT(
+                    type=INPUT_MOUSE,
+                    mi=MOUSEINPUT(
+                        dx=dx,
+                        dy=dy,
+                        mouseData=0,
+                        dwFlags=MOUSEEVENTF_MOVE,
+                        dwExtraInfo=SENTINEL,
+                    ),
+                )
+            ]
+        )
+        self._report_edge(*self.cursor_position())
 
     def inject_move_abs(self, x: int, y: int) -> None:
         self.warp_cursor(x, y)
@@ -484,16 +528,29 @@ class WindowsInputPlatform:
 
     def _report_edge(self, x: int, y: int) -> None:
         """Seam detection at injection time: the controller drives our
-        cursor with warps, so check the landing point for the return edge
-        instead of polling."""
+        cursor with moves, so check the landing point for the return edge
+        instead of polling.
+
+        Debounced: two consecutive landings inside the jump zone are
+        required. Injected motion is sentinel-tagged (never treated as
+        local input by the hooks), so the only revert trigger from the
+        injection path is this check; requiring a stable dwell at the edge
+        keeps a single-frame landing from ending a session by accident.
+        """
         if self._mode != "remote" or self.engine is None:
             return
         try:
             side = in_jump_zone(self.screen_layout(), x, y)
-            if side is not None:
-                self.engine.on_remote_edge(side, x, y)
         except Exception:
-            pass
+            return
+        if side is None:
+            self._edge_hits = 0
+            return
+        self._edge_hits += 1
+        if self._edge_hits < 2:
+            return
+        self._edge_hits = 0
+        self.engine.on_remote_edge(side, x, y)
 
     def inject_button(self, button: int, down: bool) -> None:
         flags = {
