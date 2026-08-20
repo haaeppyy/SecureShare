@@ -78,9 +78,6 @@ class StubKVM:
     def control_state(self, fp):
         return self._controls.get(fp, "local")
 
-    def control_label(self, fp):
-        return self.control_state(fp)
-
 
 class StubDiscovery:
     def __init__(self, peers):

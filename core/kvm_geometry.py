@@ -10,23 +10,12 @@ machines is that edge on my side and its opposite edge on the peer's
 side, so mismatched screen sizes align by proportional position along
 the seam (fraction 0..1).
 
-v2: seams are computed against the union bounds of all local monitors
-(the true outer edges, so moving between my own monitors never looks
-like a seam) with a monitor-membership guard: a point inside the union
-but in empty space (uneven monitor heights create such strips) is never
-a seam. Seam fractions map against the monitor the cursor is actually
-in, so stacked/side-by-side monitors of different sizes align
-proportionally per segment.
+v1: seams are computed against the union bounds of all local monitors,
+which is exact for the single-monitor case.
 """
 
 SIDES = ("left", "right", "top", "bottom")
 JUMP_ZONE = 3  # px from an edge that counts as reaching for the neighbor
-# Wider zone used ONLY to decide when an edge latch (_blocked_edge) may
-# clear after a handoff returns control: the cursor is restored just
-# inside the seam (return_point), so a 3 px clear zone would drop the
-# latch on the first residual wiggle.  Must stay wider than the return
-# point inset (JUMP_ZONE + 1) and is never used for seam detection.
-LATCH_ZONE = 8
 # A handoff must begin visibly inside the receiving display.  Starting only
 # one jump-zone past the edge makes residual motion from the crossing clamp
 # the cursor back to that edge before the user can steer it.
@@ -95,17 +84,6 @@ class ScreenLayout:
     def height(self) -> int:
         return self.bottom() - self.top()
 
-    def monitor_at(self, x: int, y: int) -> "Monitor | None":
-        """The monitor containing (x, y), or None in empty union space.
-
-        Edge-inclusive: a point exactly on a monitor's edge belongs to it
-        (that is where the seam math runs).
-        """
-        for m in self.monitors:
-            if m.x <= x <= m.x + m.w and m.y <= y <= m.y + m.h:
-                return m
-        return None
-
     # -- serialization --------------------------------------------------------
 
     def to_monitors(self) -> list[dict]:
@@ -135,40 +113,18 @@ class ScreenLayout:
 
 
 def seam_fraction(layout: ScreenLayout, side: str, x: int, y: int) -> float:
-    """0..1 position of (x, y) along the seam on ``side`` of ``layout``.
-
-    The fraction maps against the monitor the point is actually in, so
-    multiple monitors of different sizes each align proportionally along
-    the seam segment they contribute.  Falls back to the union bounds for
-    out-of-monitor coordinates (the peer mapping is union-based).
-    """
-    m = layout.monitor_at(x, y)
+    """0..1 position of (x, y) along the seam on ``side`` of ``layout``."""
     if side in ("left", "right"):
-        if m is not None:
-            denom = (m.h - 1) or 1
-            return max(0.0, min(1.0, (y - m.y) / denom))
         denom = (layout.height() - 1) or 1
         return max(0.0, min(1.0, (y - layout.top()) / denom))
     if side in ("top", "bottom"):
-        if m is not None:
-            denom = (m.w - 1) or 1
-            return max(0.0, min(1.0, (x - m.x) / denom))
         denom = (layout.width() - 1) or 1
         return max(0.0, min(1.0, (x - layout.left()) / denom))
     raise GeometryError(f"unknown side {side!r}")
 
 
-def _presses_outer_edge(layout: ScreenLayout, x: int, y: int, zone: int) -> str | None:
-    """The real outer edge (x, y) presses against within ``zone`` px, or None.
-
-    Inside a monitor the union edges are tested (they are always real
-    outer edges: any monitor touching the union edge contributes that
-    edge). A point in empty union space - the strips uneven monitor
-    heights leave inside the OS-visible desktop - is never a seam. A
-    point beyond the union entirely counts as pressing the edge it
-    exited: real OSes clamp the cursor to the desktop, but test fakes
-    and fast motion can overshoot, and a cursor 1 px past the wall is
-    still "at" the wall.
+def in_jump_zone(layout: ScreenLayout, x: int, y: int, zone: int = JUMP_ZONE) -> str | None:
+    """The side whose edge (x, y) is within ``zone`` px, or None.
 
     Corners return the horizontal side first (Input Leap behaviour);
     vertical is the fallback.
@@ -188,35 +144,8 @@ def _presses_outer_edge(layout: ScreenLayout, x: int, y: int, zone: int) -> str 
     return None
 
 
-def in_jump_zone(layout: ScreenLayout, x: int, y: int, zone: int = JUMP_ZONE) -> str | None:
-    """The side whose edge (x, y) is within ``zone`` px, or None.
-
-    Only real outer edges are seams: the point must be inside an actual
-    monitor, or pressing beyond the union (see
-    :func:`_presses_outer_edge`).  Uneven monitor heights leave strips of
-    the union bounds that belong to no monitor (the OS lets the cursor
-    park there), and the internal boundary between two of my own monitors
-    is never a seam.
-    """
-    if layout.monitor_at(x, y) is None:
-        if not _beyond_union(layout, x, y):
-            return None
-    return _presses_outer_edge(layout, x, y, zone)
-
-
-def _beyond_union(layout: ScreenLayout, x: int, y: int) -> bool:
-    return x < layout.left() or x > layout.right() - 1 or y < layout.top() or y > layout.bottom() - 1
-
-
 def clamp_to_edge(layout: ScreenLayout, x: int, y: int, zone: int = JUMP_ZONE) -> tuple[int, int]:
-    """Park (x, y) on the edge when inside a jump zone (prevents overshoot).
-
-    Like :func:`in_jump_zone`, only real outer monitor edges count: a
-    point in empty union space is left alone, a point beyond the union is
-    pulled back inside.
-    """
-    if layout.monitor_at(x, y) is None and not _beyond_union(layout, x, y):
-        return x, y
+    """Park (x, y) on the edge when inside a jump zone (prevents overshoot)."""
     left, top, right, bottom = layout.left(), layout.top(), layout.right(), layout.bottom()
     if x <= left + zone:
         x = left

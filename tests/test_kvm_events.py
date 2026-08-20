@@ -18,7 +18,6 @@ from core.kvm_events import (
     KIND_MOUSE_MOVE_ABS,
     KIND_MOUSE_MOVE_REL,
     KIND_MOUSE_WHEEL,
-    KIND_PING,
     KIND_SCREEN_INFO,
     decode_abs,
     decode_button,
@@ -33,7 +32,6 @@ from core.kvm_events import (
     decode_screen_info,
     decode_wheel,
     encode_abs,
-    encode_all_keys_up,
     encode_button,
     encode_control_request,
     encode_edge_hit,
@@ -45,8 +43,8 @@ from core.kvm_events import (
     encode_rel,
     encode_screen_info,
     encode_wheel,
-    pack_frame,
-    unpack_frame,
+    pack_event,
+    unpack_event,
 )
 from core.transfer import ProtocolError
 
@@ -160,52 +158,26 @@ def test_handoff_kinds_in_order():
 
 
 def test_pack_unpack_roundtrip():
-    hid, seq, kind, body = unpack_frame(
-        pack_frame(0x12345678, 3, KIND_KEY_DOWN, encode_key(0x04))
-    )
-    assert (hid, seq, kind) == (0x12345678, 3, KIND_KEY_DOWN)
+    kind, body = unpack_event(pack_event(KIND_KEY_DOWN, encode_key(0x04)))
+    assert kind == KIND_KEY_DOWN
     assert decode_key(body) == 0x04
 
 
-def test_frame_is_big_endian_9_byte_header():
-    frame = pack_frame(0xDEADBEEF, 0x00000042, KIND_PING)
-    assert frame == b"\xde\xad\xbe\xef\x00\x00\x00\x42\x0e"
-    hid, seq, kind, body = unpack_frame(frame)
-    assert (hid, seq, kind, body) == (0xDEADBEEF, 0x42, KIND_PING, b"")
-
-
-def test_unpack_rejects_short():
-    for bad in (b"", b"\x01\x02\x03", b"\x00" * 8):
-        with pytest.raises(ProtocolError):
-            unpack_frame(bad)
+def test_unpack_rejects_empty():
+    with pytest.raises(ProtocolError):
+        unpack_event(b"")
 
 
 def test_pack_rejects_bad_kind():
     with pytest.raises(ValueError):
-        pack_frame(0, 0, 0x100)
-
-
-def test_pack_rejects_out_of_range_ids():
-    with pytest.raises(ValueError):
-        pack_frame(0x100000000, 0, KIND_PING)
-    with pytest.raises(ValueError):
-        pack_frame(0, 0x100000000, KIND_PING)
+        pack_event(0x100)
 
 
 def test_all_kinds_mapped():
     from core import kvm_events as ke
 
     for kind in ke.KINDS:
-        assert unpack_frame(pack_frame(0, 0, kind))[2] == kind
-
-
-def test_all_keys_up_roundtrip():
-    assert decode_handoff_id(encode_all_keys_up(0xABCD)) == 0xABCD
-
-
-def test_all_keys_up_rejects_bad_length():
-    with pytest.raises(ProtocolError):
-        decode_handoff_id(encode_all_keys_up(0xABCD) + b"\x00")
+        assert pack_event(kind) == bytes([kind])
 
 
 def test_kvm_channels_disable_nagle_buffering():

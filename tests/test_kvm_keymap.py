@@ -2,7 +2,6 @@ import pytest
 
 from core.kvm_keymap import (
     EXCLUDED_HID,
-    ESCAPE_CHORD_HID,
     HID_TO_MAC_VK,
     HID_TO_WIN_SCAN,
     MAC_VK_TO_HID,
@@ -90,10 +89,6 @@ def test_modifiers():
     assert modifier_hids_for_mask(1) == [0x95]  # shift -> left shift
     assert modifier_hids_for_mask(16) == [0x9A]  # altgr stays right alt
     assert set(modifier_hids_for_mask(1 | 2)) == {0x95, 0x94}
-
-
-def test_escape_chord():
-    assert ESCAPE_CHORD_HID == {0x94, 0x96, 0x2C}
 
 
 pytestmark = pytest.mark.unit

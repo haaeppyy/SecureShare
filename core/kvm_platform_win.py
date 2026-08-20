@@ -3,7 +3,7 @@
 Capture: WH_MOUSE_LL + WH_KEYBOARD_LL low-level hooks on a dedicated
 message-pump thread. The hooks never cancel injected (sentinel) input and
 pass everything through while the engine is stopped; in ``local`` mode
-they forward events to the engine (seam detection, chord arming) and pass
+they forward events to the engine (seam detection) and pass
 them through; in ``controlling``/``remote`` mode they block local input
 (return 1) so local apps never see it.
 
@@ -98,15 +98,6 @@ if _WIN_OK:
     _user32.GetCursorPos.restype = ctypes.c_int
     _user32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
     _user32.SetCursorPos.restype = ctypes.c_int
-    _user32.ShowCursor.argtypes = (ctypes.c_int,)
-    _user32.ShowCursor.restype = ctypes.c_int
-    # CallNextHookEx without argtypes truncates wParam/lParam to 32 bits on
-    # 64-bit Windows, corrupting the event we pass down the chain.  The
-    # lParam of a low-level hook is the pointer to the hook struct; passing
-    # the struct object re-derived via from_address works, but the raw
-    # LPARAM is what the OS gave us, so forward that untouched.
-    _user32.CallNextHookEx.argtypes = (wt.HHOOK, ctypes.c_int, wt.WPARAM, wt.LPARAM)
-    _user32.CallNextHookEx.restype = wt.LPARAM
 
     # Input types / flags
     INPUT_MOUSE = 0
@@ -150,7 +141,6 @@ if _WIN_OK:
     WM_SYSKEYUP = 0x0105
     LLKHF_EXTENDED = 0x01
     LLKHF_INJECTED = 0x10
-    LLMHF_INJECTED = 0x01
 
 
 class WindowsPlatformError(Exception):
@@ -162,8 +152,6 @@ class WindowsInputPlatform:
         self.engine = None
         self._hook_thread = None
         self._hook_ids = []
-        self._mouse_proc = None
-        self._kbd_proc = None
         self._mode = "local"
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -171,13 +159,8 @@ class WindowsInputPlatform:
         # Recent untaggable SetCursorPos moves. A single slot races when the
         # hook queue receives a burst of remote cursor updates.
         self._ignore_warps = deque()
-        self._physical_pressed = set()  # physical keys held (hook dedupe)
-        self._injected_pressed = set()  # keys we injected that are still down
+        self._pressed = set()
         self._virtual = None  # virtual-desktop pixel bounds (l, t, r, b)
-        self._cursor_hidden = False
-        self._send_input_failures = 0
-        self._last_send_input_error = 0.0
-        self._first_exception = None
         if _WIN_OK:
             try:
                 ctypes.windll.user32.SetProcessDPIAware()
@@ -191,7 +174,6 @@ class WindowsInputPlatform:
         if not _WIN_OK:
             raise WindowsPlatformError("pywin32 unavailable")
         self.engine = engine
-        engine._capture_origin = "win"
         self._stop.clear()
         self._hook_thread = threading.Thread(target=self._hook_main, name="kvm-hooks", daemon=True)
         self._hook_thread.start()
@@ -232,161 +214,87 @@ class WindowsInputPlatform:
     # -- hooks ------------------------------------------------------------------
 
     def _hook_main(self) -> None:
-        # Keep strong references: pywin32 does not hold the callback, and a
-        # garbage-collected proc makes the hook silently dead.
-        try:
-            self._mouse_proc = self._make_mouse_proc()
-            self._kbd_proc = self._make_kbd_proc()
-            hooks = [
-                win32gui.SetWindowsHookEx(WH_MOUSE_LL, self._mouse_proc, None, 0),
-                win32gui.SetWindowsHookEx(WH_KEYBOARD_LL, self._kbd_proc, None, 0),
-            ]
-            if not all(hooks):
-                raise WindowsPlatformError(
-                    f"SetWindowsHookEx failed (handles: {[h for h in hooks]})"
-                )
-            self._hook_ids = hooks
-            win32gui.PumpMessages()
-        except Exception as exc:
-            self._note_exception(exc)
-
-    def _note_exception(self, exc: Exception) -> None:
-        """Surface a hook-thread failure instead of dying silently.
-
-        The previous behaviour left a dead hook thread with no trace: the
-        app ran, the engine believed input capture was alive, and KVM
-        silently did nothing (diagnostics showed hook_thread_alive False).
-        """
-        engine = self.engine
-        if engine is None:
-            return
-        first = False
-        with self._lock:
-            if self._first_exception is None:
-                self._first_exception = f"{type(exc).__name__}: {exc}"
-                first = True
-        if first:
-            try:
-                engine.on_platform_input_lost()
-            except Exception:
-                pass
-            try:
-                engine.on_status(
-                    f"KVM: input capture failed on this device ({self._first_exception}) - "
-                    "see diagnostics for details",
-                    level="error",
-                )
-            except Exception:
-                pass
-
-    def _make_mouse_proc(self):
         def mouse_proc(nCode, wParam, lParam):
             if nCode >= 0:
                 try:
-                    return self._handle_mouse(wParam, lParam)
+                    info = MSLLHOOKSTRUCT.from_address(lParam)
+                    return self._handle_mouse(wParam, info)
                 except Exception:
                     pass
             return _user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-        return mouse_proc
-
-    def _make_kbd_proc(self):
         def kbd_proc(nCode, wParam, lParam):
             if nCode >= 0:
                 try:
-                    return self._handle_key(wParam, lParam)
+                    info = KBDLLHOOKSTRUCT.from_address(lParam)
+                    return self._handle_key(wParam, info)
                 except Exception:
                     pass
             return _user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-        return kbd_proc
+        self._hook_ids = [
+            win32gui.SetWindowsHookEx(WH_MOUSE_LL, mouse_proc, None, 0),
+            win32gui.SetWindowsHookEx(WH_KEYBOARD_LL, kbd_proc, None, 0),
+        ]
+        win32gui.PumpMessages()
 
-    def _handle_mouse(self, wParam, lParam) -> int:
-        info = MSLLHOOKSTRUCT.from_address(lParam)
-        if info.dwExtraInfo == SENTINEL or (info.flags & LLMHF_INJECTED):
+    def _handle_mouse(self, wParam, info) -> int:
+        if info.dwExtraInfo == SENTINEL:
             # Ignore injected input for transport, but let Windows deliver it
             # to the remote app. Returning 1 here cancels the injection.
-            return _user32.CallNextHookEx(None, 0, wParam, lParam)
+            return _user32.CallNextHookEx(None, 0, wParam, info)
         engine = self.engine
         if engine is None:
-            return _user32.CallNextHookEx(None, 0, wParam, lParam)
-        mode = self._mode
+            return _user32.CallNextHookEx(None, 0, wParam, info)
         x, y = int(info.pt.x), int(info.pt.y)
         if wParam == WM_MOUSEMOVE and self._consume_warp_move(x, y):
-            # A warp landed; follow it so the next *physical* delta is
-            # relative to the actual cursor, not a stale position.
-            self._last_pos = (x, y)
-            return _user32.CallNextHookEx(None, 0, wParam, lParam)
-        if mode == "remote":
-            # Explicit ownership: physical pointer input never ends the
-            # session.  The cursor is hidden and events pass through to
-            # local apps (invisible), so nothing is forwarded.
-            return _user32.CallNextHookEx(None, 0, wParam, lParam)
+            return _user32.CallNextHookEx(None, 0, wParam, info)
+        if self._mode == "remote":
+            # Physical input on the controlled computer intentionally ends
+            # sharing. SentInput events were returned above by their sentinel.
+            engine.on_remote_local_input()
+            return 1
         try:
             if wParam == WM_MOUSEMOVE:
                 if self._last_pos is not None:
                     dx, dy = x - self._last_pos[0], y - self._last_pos[1]
                 else:
-                    # First move after a delegation change: no baseline, so
-                    # discard the delta (the cursor may have been parked).
                     dx = dy = 0
                 self._last_pos = (x, y)
-                engine.observe_local_mouse(dx, dy, x, y)
-                if mode == "controlling":
-                    engine.send_controlled_mouse(dx, dy)
+                engine.on_local_mouse(dx, dy, x, y)
             elif wParam == WM_LBUTTONDOWN:
-                engine.observe_local_button(0, True)
-                if mode == "controlling":
-                    engine.send_controlled_button(0, True)
+                engine.on_local_button(0, True)
             elif wParam == WM_LBUTTONUP:
-                engine.observe_local_button(0, False)
-                if mode == "controlling":
-                    engine.send_controlled_button(0, False)
+                engine.on_local_button(0, False)
             elif wParam == WM_RBUTTONDOWN:
-                engine.observe_local_button(1, True)
-                if mode == "controlling":
-                    engine.send_controlled_button(1, True)
+                engine.on_local_button(1, True)
             elif wParam == WM_RBUTTONUP:
-                engine.observe_local_button(1, False)
-                if mode == "controlling":
-                    engine.send_controlled_button(1, False)
+                engine.on_local_button(1, False)
             elif wParam == WM_MBUTTONDOWN:
-                engine.observe_local_button(2, True)
-                if mode == "controlling":
-                    engine.send_controlled_button(2, True)
+                engine.on_local_button(2, True)
             elif wParam == WM_MBUTTONUP:
-                engine.observe_local_button(2, False)
-                if mode == "controlling":
-                    engine.send_controlled_button(2, False)
+                engine.on_local_button(2, False)
             elif wParam == WM_XBUTTONDOWN or wParam == WM_XBUTTONUP:
                 button = 2 + (info.mouseData >> 16)
-                engine.observe_local_button(button, wParam == WM_XBUTTONDOWN)
-                if mode == "controlling":
-                    engine.send_controlled_button(button, wParam == WM_XBUTTONDOWN)
+                engine.on_local_button(button, wParam == WM_XBUTTONDOWN)
             elif wParam == WM_MOUSEWHEEL:
                 dy = ctypes.c_short(info.mouseData >> 16).value
-                engine.observe_local_wheel(dy, 0)
-                if mode == "controlling":
-                    engine.send_controlled_wheel(dy, 0)
+                engine.on_local_wheel(dy, 0)
             elif wParam == WM_MOUSEHWHEEL:
                 dx = ctypes.c_short(info.mouseData >> 16).value
-                engine.observe_local_wheel(0, dx)
-                if mode == "controlling":
-                    engine.send_controlled_wheel(0, dx)
+                engine.on_local_wheel(0, dx)
         except Exception:
             pass
-        if mode == "local":
-            return _user32.CallNextHookEx(None, 0, wParam, lParam)
-        return 1  # suppress while controlling
+        if self._mode == "local":
+            return _user32.CallNextHookEx(None, 0, wParam, info)
+        return 1  # suppress in controlling/remote
 
-    def _handle_key(self, wParam, lParam) -> int:
-        info = KBDLLHOOKSTRUCT.from_address(lParam)
-        if info.dwExtraInfo == SENTINEL or (info.flags & LLKHF_INJECTED):
-            return _user32.CallNextHookEx(None, 0, wParam, lParam)
+    def _handle_key(self, wParam, info) -> int:
+        if info.dwExtraInfo == SENTINEL:
+            return _user32.CallNextHookEx(None, 0, wParam, info)
         engine = self.engine
         if engine is None:
-            return _user32.CallNextHookEx(None, 0, wParam, lParam)
-        mode = self._mode
+            return _user32.CallNextHookEx(None, 0, wParam, info)
         try:
             from .kvm_keymap import win_scan_to_hid
 
@@ -394,66 +302,23 @@ class WindowsInputPlatform:
             if hid is not None:
                 down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
                 if down:
-                    if hid in self._physical_pressed:
-                        # OS autorepeat: already forwarded, never twice.
-                        return (
-                            _user32.CallNextHookEx(None, 0, wParam, lParam)
-                            if mode != "controlling"
-                            else 1
-                        )
-                    self._physical_pressed.add(hid)
+                    if hid in self._pressed:
+                        return 1 if self._mode != "local" else _user32.CallNextHookEx(None, 0, wParam, info)
+                    self._pressed.add(hid)
                 else:
-                    self._physical_pressed.discard(hid)
-                engine.observe_local_key(hid, down)
-                if mode == "controlling":
-                    engine.send_controlled_key(hid, down)
+                    self._pressed.discard(hid)
+                engine.on_local_key(hid, down)
         except Exception:
             pass
-        if mode == "remote":
-            # Explicit ownership: keys pass through to local apps; they were
-            # reported to the engine only for ownership-chord recognition.
-            return _user32.CallNextHookEx(None, 0, wParam, lParam)
-        if mode == "local":
-            return _user32.CallNextHookEx(None, 0, wParam, lParam)
-        return 1  # suppress while controlling
+        if self._mode == "local":
+            return _user32.CallNextHookEx(None, 0, wParam, info)
+        return 1
 
     # -- delegation --------------------------------------------------------------
 
-    def set_delegation(self, state: str) -> bool:
+    def set_delegation(self, state: str) -> None:
         with self._lock:
-            old = self._mode
             self._mode = state
-            if old == "remote" and state != "remote":
-                # Defense in depth: keys/buttons we injected while remote are
-                # released locally so nothing stays stuck if the engine's own
-                # release path is interrupted.
-                self._release_injected_keys()
-            if state == "controlling":
-                # A delegation change parks/restores the cursor; the first
-                # physical move afterwards has no baseline, so its delta is
-                # discarded (otherwise a stale position yields a huge jump).
-                self._last_pos = None
-                self._ignore_warps.clear()
-            if state == "local":
-                self.show_cursor()
-        return True
-
-    def _release_injected_keys(self) -> None:
-        for hid in sorted(self._injected_pressed):
-            self._inject_key_inner(hid, False)
-        self._injected_pressed.clear()
-
-    def diagnostics(self) -> dict:
-        with self._lock:
-            return {
-                "family": "win",
-                "mode": self._mode,
-                "hook_thread_alive": bool(self._hook_thread and self._hook_thread.is_alive()),
-                "ignore_warps": len(self._ignore_warps),
-                "send_input_failures": self._send_input_failures,
-                "cursor_hidden": self._cursor_hidden,
-                "first_exception": self._first_exception,
-            }
 
     # -- geometry -----------------------------------------------------------------
 
@@ -522,11 +387,6 @@ class WindowsInputPlatform:
         return matched
 
     def _warp_fallback(self, x: int, y: int) -> None:
-        self._send_abs_move(x, y)
-
-    def _send_abs_move(self, x: int, y: int) -> None:
-        """Absolute pointer move via SendInput, normalized to the virtual
-        desktop (MOUSEEVENTF_ABSOLUTE|VIRTUALDESK)."""
         if self._virtual is None:
             return
         vx, vy, vr, vb = self._virtual
@@ -534,7 +394,7 @@ class WindowsInputPlatform:
         ny = int((y - vy) * 65535.0 / max(1, vb - vy))
         nx = max(0, min(65535, nx))
         ny = max(0, min(65535, ny))
-        self._send_input(
+        _send_input(
             [
                 INPUT(
                     type=INPUT_MOUSE,
@@ -550,34 +410,16 @@ class WindowsInputPlatform:
         )
 
     def hide_cursor(self) -> None:
-        """Hide the local cursor while we control the peer (one visible
-        cursor at a time). ShowCursor uses a global display count, so the
-        loop keeps decrementing until the cursor is actually gone."""
-        if self._cursor_hidden or not _WIN_OK:
-            return
-        for _ in range(40):
-            if _user32.ShowCursor(False) < 0:
-                break
-        self._cursor_hidden = True
+        pass  # best-effort on Windows; the tray app has no owner window
 
     def show_cursor(self) -> None:
-        if not self._cursor_hidden or not _WIN_OK:
-            return
-        for _ in range(40):
-            if _user32.ShowCursor(True) >= 0:
-                break
-        self._cursor_hidden = False
+        pass
 
     # -- injection -----------------------------------------------------------------
 
     def inject_move_rel(self, dx: int, dy: int) -> None:
-        if not dx and not dy:
-            return
-        # SendInput *relative* moves apply the user's pointer acceleration,
-        # so injected deltas would be wrong.  Compute the absolute landing
-        # point from the current position and send an exact absolute move.
-        cx, cy = self.cursor_position()
-        self._send_abs_move(cx + dx, cy + dy)
+        x, y = self.cursor_position()
+        self.inject_move_abs(x + dx, y + dy)
 
     def inject_move_abs(self, x: int, y: int) -> None:
         self.warp_cursor(x, y)
@@ -607,7 +449,7 @@ class WindowsInputPlatform:
         if flags is None:
             return
         down_flag, up_flag, data = flags
-        self._send_input(
+        _send_input(
             [
                 INPUT(
                     type=INPUT_MOUSE,
@@ -651,16 +493,9 @@ class WindowsInputPlatform:
                 )
             )
         if inputs:
-            self._send_input(inputs)
+            _send_input(inputs)
 
     def inject_key(self, hid: int, down: bool) -> None:
-        if down:
-            self._injected_pressed.add(hid)
-        else:
-            self._injected_pressed.discard(hid)
-        self._inject_key_inner(hid, down)
-
-    def _inject_key_inner(self, hid: int, down: bool) -> None:
         from .kvm_keymap import hid_to_win_scan
 
         entry = hid_to_win_scan(hid)
@@ -670,7 +505,7 @@ class WindowsInputPlatform:
         flags = KEYEVENTF_SCANCODE | (KEYEVENTF_EXTENDEDKEY if extended else 0)
         if not down:
             flags |= KEYEVENTF_KEYUP
-        self._send_input(
+        _send_input(
             [
                 INPUT(
                     type=INPUT_KEYBOARD,
@@ -679,22 +514,9 @@ class WindowsInputPlatform:
             ]
         )
 
-    def _send_input(self, inputs: list) -> None:
-        if not inputs:
-            return
-        arr = (INPUT * len(inputs))(*inputs)
-        sent = _user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
-        if sent != len(inputs):
-            self._send_input_failures += 1
-            now = time.monotonic()
-            if now - self._last_send_input_error > 10.0:
-                self._last_send_input_error = now
-                try:
-                    if self.engine is not None:
-                        self.engine.on_status(
-                            f"KVM: SendInput delivered {sent}/{len(inputs)} events "
-                            f"(error {ctypes.get_last_error()})",
-                            level="error",
-                        )
-                except Exception:
-                    pass
+
+def _send_input(inputs: list) -> None:
+    if not inputs:
+        return
+    arr = (INPUT * len(inputs))(*inputs)
+    _user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))

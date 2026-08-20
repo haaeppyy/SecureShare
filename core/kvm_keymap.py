@@ -45,9 +45,6 @@ MODIFIER_MASK_TO_HID = {
     MOD_ALTGR: 0x9A,
 }
 
-# Emergency escape chord: Ctrl + Alt + Space (HID).
-ESCAPE_CHORD_HID = frozenset((0x94, 0x96, 0x2C))
-
 # HID codes excluded from forwarding (non-US, power, F13-F24, IME/Lang).
 # 0x48 (Pause) collides with Num Lock on PS/2 (both 0x45); Pause needs the
 # E1 1D 45 sequence, so it is excluded from Windows injection.
