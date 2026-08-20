@@ -82,6 +82,8 @@ class MacInputPlatform:
         self._soft_x = 0
         self._soft_y = 0
         self._soft_valid = False
+        self._ignore_next_motion = False
+        self._edge_hits = 0
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -310,6 +312,13 @@ class MacInputPlatform:
                 q.kCGEventRightMouseDragged,
                 q.kCGEventOtherMouseDragged,
             ):
+                if self._mode == "controlling":
+                    # The first motion event after disassociation can carry
+                    # a large stale pre-entry delta; discard it once.
+                    with self._lock:
+                        if self._ignore_next_motion:
+                            self._ignore_next_motion = False
+                            return
                 dx = q.CGEventGetIntegerValueField(event, q.kCGMouseEventDeltaX)
                 dy = q.CGEventGetIntegerValueField(event, q.kCGMouseEventDeltaY)
                 pos = q.CGEventGetLocation(event)
@@ -352,8 +361,6 @@ class MacInputPlatform:
     # -- delegation ------------------------------------------------------------
 
     def set_delegation(self, state: str) -> None:
-        with self._lock:
-            self._mode = state
         q = _q()
         if state in ("remote", "controlling"):
             # Decouples hardware mouse deltas from the on-screen cursor.
@@ -363,15 +370,32 @@ class MacInputPlatform:
             # swallowing the CGEvent in the tap callback only stops apps
             # from seeing it, it does not stop WindowServer from moving the
             # cursor sprite off raw HID deltas.
-            q.CGAssociateMouseAndMouseCursorPosition(False)
-            if state == "remote":
-                with self._lock:
+            try:
+                q.CGAssociateMouseAndMouseCursorPosition(False)
+            except Exception:
+                pass
+            with self._lock:
+                if state == "controlling":
+                    # The first motion event after disassociation can carry
+                    # a large stale pre-entry delta (input accumulated while
+                    # the handoff handshake ran); mark it discardable. The
+                    # flag is set before mode flips so no stale delta can be
+                    # forwarded the moment controlling begins.
+                    self._ignore_next_motion = True
+                else:
                     # Handoff entry: the next relative move re-derives the
                     # software position from the real cursor, so the injected
                     # stream and the real cursor agree before accumulating.
                     self._soft_valid = False
+                    self._edge_hits = 0
+                self._mode = state
         elif state == "local":
-            q.CGAssociateMouseAndMouseCursorPosition(True)
+            try:
+                q.CGAssociateMouseAndMouseCursorPosition(True)
+            except Exception:
+                pass
+            with self._lock:
+                self._mode = state
             self.show_cursor()
 
     # -- geometry ---------------------------------------------------------------
@@ -456,15 +480,26 @@ class MacInputPlatform:
     def _report_edge(self, x: int, y: int) -> None:
         """Seam detection at injection time: the controller drives our
         cursor with warps, so check the landing point for the return edge
-        instead of polling."""
+        instead of polling.
+
+        Debounced like the Windows side: two consecutive landings inside
+        the jump zone are required, so a single-frame landing (a large
+        delta overshooting into the zone) cannot end a session by accident.
+        """
         if self._mode != "remote" or self.engine is None:
             return
         try:
             side = in_jump_zone(self.screen_layout(), x, y)
-            if side is not None:
-                self.engine.on_remote_edge(side, x, y)
         except Exception:
-            pass
+            return
+        if side is None:
+            self._edge_hits = 0
+            return
+        self._edge_hits += 1
+        if self._edge_hits < 2:
+            return
+        self._edge_hits = 0
+        self.engine.on_remote_edge(side, x, y)
 
     def inject_button(self, button: int, down: bool) -> None:
         q = _q()
