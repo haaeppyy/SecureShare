@@ -26,15 +26,26 @@ from .kvm_geometry import Monitor, ScreenLayout, in_jump_zone
 
 SENTINEL = 0x5E4C0DE5
 
+# Low-level WH_*_LL hooks run in the calling thread, so call user32 directly
+# via ctypes (as the rest of this module does).  pywin32's win32gui has never
+# exposed SetWindowsHookEx/UnhookWindowsHookEx, so routing the hook API
+# through it raised AttributeError on every modern pywin32 and the hook
+# thread died silently right after start (hook_thread_alive False).
 try:
     import win32api
-    import win32gui
 
-    _WIN_OK = True
+    _WIN_API_OK = hasattr(win32api, "EnumDisplayMonitors")
+    _WIN_OK = _WIN_API_OK
 except ImportError:  # pragma: no cover - non-Windows
     win32api = None
-    win32gui = None
+    _WIN_API_OK = False
     _WIN_OK = False
+
+_WIN_IMPORT_HINT = (
+    "pywin32 unavailable - install pywin32>=306 and rebuild"
+    if not _WIN_API_OK
+    else "pywin32 too old (win32api.EnumDisplayMonitors missing) - install pywin32>=306 and rebuild"
+)
 
 if _WIN_OK:
     _user32 = ctypes.windll.user32
@@ -91,6 +102,39 @@ if _WIN_OK:
             ("time", ctypes.c_ulong),
             ("dwExtraInfo", ULONG_PTR),
         ]
+
+    # Low-level hook installation and the message pump the hook thread runs.
+    # Callbacks are wrapped in HOOKPROC and kept as strong references (the
+    # hook-thread locals in _hook_main); a garbage-collected callback makes
+    # the hook silently dead.
+    HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+
+    class MSG(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wt.HWND),
+            ("message", ctypes.c_uint),
+            ("wParam", wt.WPARAM),
+            ("lParam", wt.LPARAM),
+            ("time", ctypes.c_ulong),
+            ("pt", POINT),
+        ]
+
+    # CallNextHookEx without argtypes truncates wParam/lParam to 32 bits on
+    # 64-bit Windows, corrupting the event passed down the chain, so the raw
+    # LPARAM is forwarded untouched.
+    _user32.CallNextHookEx.argtypes = (wt.HHOOK, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+    _user32.CallNextHookEx.restype = wt.LPARAM
+
+    _user32.SetWindowsHookExW.restype = ctypes.c_ssize_t
+    _user32.SetWindowsHookExW.argtypes = (ctypes.c_int, HOOKPROC, wt.HINSTANCE, wt.DWORD)
+    _user32.UnhookWindowsHookEx.restype = ctypes.c_int
+    _user32.UnhookWindowsHookEx.argtypes = (ctypes.c_ssize_t,)
+    _user32.GetMessageW.restype = ctypes.c_int
+    _user32.GetMessageW.argtypes = (ctypes.POINTER(MSG), wt.HWND, ctypes.c_uint, ctypes.c_uint)
+    _user32.TranslateMessage.restype = ctypes.c_int
+    _user32.TranslateMessage.argtypes = (ctypes.POINTER(MSG),)
+    _user32.DispatchMessageW.restype = wt.LPARAM
+    _user32.DispatchMessageW.argtypes = (ctypes.POINTER(MSG),)
 
     _user32.SendInput.restype = ctypes.c_uint
     _user32.SendInput.argtypes = (ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int)
@@ -172,7 +216,7 @@ class WindowsInputPlatform:
 
     def start(self, engine) -> None:
         if not _WIN_OK:
-            raise WindowsPlatformError("pywin32 unavailable")
+            raise WindowsPlatformError(_WIN_IMPORT_HINT or "pywin32 unavailable")
         self.engine = engine
         self._stop.clear()
         self._hook_thread = threading.Thread(target=self._hook_main, name="kvm-hooks", daemon=True)
@@ -182,7 +226,7 @@ class WindowsInputPlatform:
         self._stop.set()
         for h in self._hook_ids:
             try:
-                win32gui.UnhookWindowsHookEx(h)
+                _user32.UnhookWindowsHookEx(h)
             except Exception:
                 pass
         self._hook_ids = []
@@ -208,7 +252,7 @@ class WindowsInputPlatform:
 
     def permission_detail(self) -> str:
         if not _WIN_OK:
-            return "pywin32 unavailable"
+            return _WIN_IMPORT_HINT or "pywin32 unavailable"
         return "all permissions granted"
 
     # -- hooks ------------------------------------------------------------------
@@ -217,8 +261,7 @@ class WindowsInputPlatform:
         def mouse_proc(nCode, wParam, lParam):
             if nCode >= 0:
                 try:
-                    info = MSLLHOOKSTRUCT.from_address(lParam)
-                    return self._handle_mouse(wParam, info)
+                    return self._handle_mouse(wParam, lParam)
                 except Exception:
                     pass
             return _user32.CallNextHookEx(None, nCode, wParam, lParam)
@@ -226,29 +269,42 @@ class WindowsInputPlatform:
         def kbd_proc(nCode, wParam, lParam):
             if nCode >= 0:
                 try:
-                    info = KBDLLHOOKSTRUCT.from_address(lParam)
-                    return self._handle_key(wParam, info)
+                    return self._handle_key(wParam, lParam)
                 except Exception:
                     pass
             return _user32.CallNextHookEx(None, nCode, wParam, lParam)
 
+        mouse_proc = HOOKPROC(mouse_proc)
+        kbd_proc = HOOKPROC(kbd_proc)
         self._hook_ids = [
-            win32gui.SetWindowsHookEx(WH_MOUSE_LL, mouse_proc, None, 0),
-            win32gui.SetWindowsHookEx(WH_KEYBOARD_LL, kbd_proc, None, 0),
+            _user32.SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0),
+            _user32.SetWindowsHookExW(WH_KEYBOARD_LL, kbd_proc, None, 0),
         ]
-        win32gui.PumpMessages()
+        self._pump_messages()
 
-    def _handle_mouse(self, wParam, info) -> int:
+    def _pump_messages(self) -> None:
+        """Run the message loop for the hook thread (user32.GetMessageW).
+
+        Low-level hooks require their owning thread to pump messages;
+        GetMessageW returns 0 on WM_QUIT, which stop() posts to end the
+        thread."""
+        msg = MSG()
+        while _user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) != 0:
+            _user32.TranslateMessage(ctypes.byref(msg))
+            _user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _handle_mouse(self, wParam, lParam) -> int:
+        info = MSLLHOOKSTRUCT.from_address(lParam)
         if info.dwExtraInfo == SENTINEL:
             # Ignore injected input for transport, but let Windows deliver it
             # to the remote app. Returning 1 here cancels the injection.
-            return _user32.CallNextHookEx(None, 0, wParam, info)
+            return _user32.CallNextHookEx(None, 0, wParam, lParam)
         engine = self.engine
         if engine is None:
-            return _user32.CallNextHookEx(None, 0, wParam, info)
+            return _user32.CallNextHookEx(None, 0, wParam, lParam)
         x, y = int(info.pt.x), int(info.pt.y)
         if wParam == WM_MOUSEMOVE and self._consume_warp_move(x, y):
-            return _user32.CallNextHookEx(None, 0, wParam, info)
+            return _user32.CallNextHookEx(None, 0, wParam, lParam)
         if self._mode == "remote":
             # Physical input on the controlled computer intentionally ends
             # sharing. SentInput events were returned above by their sentinel.
@@ -286,15 +342,16 @@ class WindowsInputPlatform:
         except Exception:
             pass
         if self._mode == "local":
-            return _user32.CallNextHookEx(None, 0, wParam, info)
+            return _user32.CallNextHookEx(None, 0, wParam, lParam)
         return 1  # suppress in controlling/remote
 
-    def _handle_key(self, wParam, info) -> int:
+    def _handle_key(self, wParam, lParam) -> int:
+        info = KBDLLHOOKSTRUCT.from_address(lParam)
         if info.dwExtraInfo == SENTINEL:
-            return _user32.CallNextHookEx(None, 0, wParam, info)
+            return _user32.CallNextHookEx(None, 0, wParam, lParam)
         engine = self.engine
         if engine is None:
-            return _user32.CallNextHookEx(None, 0, wParam, info)
+            return _user32.CallNextHookEx(None, 0, wParam, lParam)
         try:
             from .kvm_keymap import win_scan_to_hid
 
@@ -303,7 +360,7 @@ class WindowsInputPlatform:
                 down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
                 if down:
                     if hid in self._pressed:
-                        return 1 if self._mode != "local" else _user32.CallNextHookEx(None, 0, wParam, info)
+                        return 1 if self._mode != "local" else _user32.CallNextHookEx(None, 0, wParam, lParam)
                     self._pressed.add(hid)
                 else:
                     self._pressed.discard(hid)
@@ -311,7 +368,7 @@ class WindowsInputPlatform:
         except Exception:
             pass
         if self._mode == "local":
-            return _user32.CallNextHookEx(None, 0, wParam, info)
+            return _user32.CallNextHookEx(None, 0, wParam, lParam)
         return 1
 
     # -- delegation --------------------------------------------------------------
