@@ -523,6 +523,9 @@ class KVMEngine:
         # requests (and notifications) until that peer cancels / the
         # channel changes.
         self._denial_latch: dict[str, str] = {}
+        # Debug aid: last gate reason toasted per (fp, side) edge dwell,
+        # so a silent seam failure names its cause exactly once.
+        self._diag_gate_latch: dict[str, str] = {}
         self._last_sent_id: dict[str, int] = {}
         self._handoff_seq = random.randrange(1 << 29)  # random start: simultaneous takeovers must never share ids
         self._perm_notified = False
@@ -576,6 +579,7 @@ class KVMEngine:
         self._handoffs.clear()
         self._blocked_edge.clear()
         self._denial_latch.clear()
+        self._diag_gate_latch.clear()
         self._last_sent_id.clear()
         self._local_mask = 0
         try:
@@ -900,6 +904,8 @@ class KVMEngine:
             if cursor_side is None or cursor_side != self._blocked_edge[fp]:
                 self._blocked_edge.pop(fp, None)
                 self._send_edge_left_cancel(fp)
+        if cursor_side is None:
+            self._diag_gate_latch.clear()
         channel = self._active_channel()
         if channel is not None:
             self._on_active_local_mouse(channel, dx, dy, x, y, cursor_side)
@@ -908,16 +914,21 @@ class KVMEngine:
             return
         channel = self._channel_for(cursor_side)
         if channel is None:
+            self._diag_gate("none", cursor_side, f"no KVM link on {cursor_side} side (peer offline, unpaired, or consent off)")
             return
         fp = channel.peer_fp
         if cursor_side != self._my_side_for(fp):
+            self._diag_gate(fp, cursor_side, f"peer {channel.peer_name} is on {self._my_side_for(fp)}, mouse is at {cursor_side}")
             return
         if fp in self._blocked_edge:
+            self._diag_gate(fp, cursor_side, f"edge {cursor_side} still blocked after refusal - move away and retry")
             return
         if not self._link_ready(fp):
+            self._diag_gate(fp, cursor_side, f"link to {channel.peer_name} not ready (no screen info yet)")
             return
         peer_layout = self._peer_layouts.get(fp)
         if peer_layout is None:
+            self._diag_gate(fp, cursor_side, f"peer layout for {channel.peer_name} not received")
             return
         fraction = seam_fraction(self._my_layout(), cursor_side, x, y)
         tx, ty = entry_point(peer_layout, cursor_side, fraction)
@@ -1071,6 +1082,7 @@ class KVMEngine:
         }
         self._last_sent_id[fp] = hid
         self._state[fp] = STATE_REQUESTING
+        self.on_status(f"KVM: requesting control of {channel.peer_name}", level="error")
         channel.send_event(KIND_CONTROL_REQUEST, encode_control_request(hid, tx, ty, self._local_mask))
 
     def _cancel_outbound(self, fp: str, reason: str) -> None:
@@ -1622,6 +1634,13 @@ class KVMEngine:
             return in_jump_zone(self._my_layout(), x, y)
         except KvmError:
             return None
+
+    def _diag_gate(self, fp: str, cursor_side: str, reason: str) -> None:
+        key = f"{fp}:{cursor_side}"
+        if self._diag_gate_latch.get(key) == reason:
+            return
+        self._diag_gate_latch[key] = reason
+        self.on_status(f"KVM blocked: {reason}", level="error")
 
     def _channel_for(self, side: str | None) -> KvmChannel | None:
         if side is None:

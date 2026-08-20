@@ -403,6 +403,16 @@ class MacInputPlatform:
         q = _q()
         q.CGWarpMouseCursorPosition((x, y))
 
+    def diagnostics(self) -> dict:
+        with self._lock:
+            return {
+                "family": "mac",
+                "mode": self._mode,
+                "tap_thread_alive": bool(self._tap_thread and self._tap_thread.is_alive()),
+                "permission_ok": self.permission_ok(),
+                "soft_valid": self._soft_valid,
+            }
+
     def hide_cursor(self) -> None:
         q = _q()
         q.CGDisplayHideCursor(q.CGMainDisplayID())

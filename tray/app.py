@@ -980,11 +980,68 @@ class TrayApp:
         return pystray.MenuItem(
             lambda item: f"Mouse & keyboard devices… ({len(peers)} paired)",
             pystray.Menu(
+                pystray.MenuItem(
+                    lambda item: self._kvm_engine_status(),
+                    None,
+                    enabled=False,
+                ),
+                pystray.MenuItem(
+                    "Request permissions",
+                    partial(self._request_kvm_permissions),
+                ),
                 pystray.MenuItem("Move across a selected screen edge to control it", None, enabled=False),
                 *peers_label,
                 *peer_items,
             ),
         )
+
+    def _request_kvm_permissions(self, icon=None, item=None):
+        try:
+            platform = self.node.kvm.platform
+            if platform is None:
+                self._toast("KVM platform not started - enable the KVM switch first", level="error")
+                return
+            platform.request_permission()
+            detail = platform.permission_detail()
+            ok = detail == "all permissions granted"
+            self._toast(
+                f"KVM permission: {'granted' if ok else 'requested - grant the system dialog, then relaunch: ' + detail}",
+                level="info" if ok else "error",
+            )
+        except Exception as exc:
+            self._toast(f"kvm error: {exc}", level="error")
+
+    def _kvm_engine_status(self):
+        try:
+            kvm = self.node.kvm
+            parts = [f"KVM {'ON' if kvm.enabled else 'OFF'}"]
+            platform = kvm.platform
+            if platform is None:
+                parts.append("Platform: none")
+            else:
+                parts.append(f"Platform: {platform.__class__.__name__.replace('InputPlatform', '')}")
+                try:
+                    diag = platform.diagnostics()
+                    if "tap_thread_alive" in diag:
+                        parts.append("Tap: " + ("alive" if diag["tap_thread_alive"] else "DEAD"))
+                    elif "hook_thread_alive" in diag:
+                        parts.append("Hooks: " + ("alive" if diag["hook_thread_alive"] else "DEAD"))
+                    if diag.get("permission_ok") is not None:
+                        if diag["permission_ok"]:
+                            parts.append("Permission: granted")
+                        else:
+                            try:
+                                detail = platform.permission_detail()
+                            except Exception:
+                                detail = "MISSING"
+                            parts.append(f"Permission: missing {detail.replace('missing macOS permission: ', '')}")
+                    if diag.get("mode"):
+                        parts.append(f"Mode: {diag['mode']}")
+                except Exception:
+                    pass
+            return " · ".join(parts)
+        except Exception:
+            return "KVM starting…"
 
     def _peer_kvm_status(self, fp, item=None):
         """Per-peer KVM state. Link and control are separate on purpose."""
