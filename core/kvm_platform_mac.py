@@ -26,7 +26,7 @@ import os
 import threading
 import time
 
-from .kvm_geometry import Monitor, ScreenLayout, in_jump_zone
+from .kvm_geometry import Monitor, ScreenLayout, in_jump_zone, pt_to_px, px_to_pt
 
 SENTINEL = 0x5E4C0DE5
 
@@ -84,6 +84,8 @@ class MacInputPlatform:
         self._soft_valid = False
         self._ignore_next_motion = False
         self._edge_hits = 0
+        self._scale = 1.0
+        self._anchor = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -102,10 +104,9 @@ class MacInputPlatform:
         # Never leave the user's pointing device decoupled if sharing stops
         # while this Mac is being controlled remotely.
         if _QUARTZ_OK:
-            try:
-                Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-            except Exception:
-                pass
+            err = Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+            if err != 0:
+                self._log_assoc_error("True", err)
         self._stop.set()
         with self._lock:
             rl = self._tap_runloop
@@ -322,7 +323,15 @@ class MacInputPlatform:
                 dx = q.CGEventGetIntegerValueField(event, q.kCGMouseEventDeltaX)
                 dy = q.CGEventGetIntegerValueField(event, q.kCGMouseEventDeltaY)
                 pos = q.CGEventGetLocation(event)
-                engine.on_local_mouse(dx, dy, int(pos.x), int(pos.y))
+                engine.on_local_mouse(pt_to_px(dx, self._scale), pt_to_px(dy, self._scale), int(pos.x), int(pos.y))
+                if self._mode == "controlling" and (dx or dy) and self._anchor is not None:
+                    # Re-park the sprite on a center anchor: the
+                    # disassociation below is a no-op while the app is not
+                    # frontmost, so the sprite follows raw HID deltas and
+                    # would wander visibly. HID deltas are relative to the
+                    # physical mouse, so the warp never distorts the
+                    # forwarded stream.
+                    q.CGWarpMouseCursorPosition(self._anchor)
             elif etype in (
                 q.kCGEventLeftMouseDown,
                 q.kCGEventLeftMouseUp,
@@ -370,10 +379,9 @@ class MacInputPlatform:
             # swallowing the CGEvent in the tap callback only stops apps
             # from seeing it, it does not stop WindowServer from moving the
             # cursor sprite off raw HID deltas.
-            try:
-                q.CGAssociateMouseAndMouseCursorPosition(False)
-            except Exception:
-                pass
+            err = q.CGAssociateMouseAndMouseCursorPosition(False)
+            if err != 0:
+                self._log_assoc_error("False", err)
             with self._lock:
                 if state == "controlling":
                     # The first motion event after disassociation can carry
@@ -389,14 +397,59 @@ class MacInputPlatform:
                     self._soft_valid = False
                     self._edge_hits = 0
                 self._mode = state
+            self._cache_geometry()
         elif state == "local":
-            try:
-                q.CGAssociateMouseAndMouseCursorPosition(True)
-            except Exception:
-                pass
+            err = q.CGAssociateMouseAndMouseCursorPosition(True)
+            if err != 0:
+                self._log_assoc_error("True", err)
             with self._lock:
                 self._mode = state
             self.show_cursor()
+
+    def _log_assoc_error(self, arg: str, err: int) -> None:
+        try:
+            if self.engine is not None:
+                self.engine.on_status(
+                    f"KVM: CGAssociateMouseAndMouseCursorPosition({arg}) failed: {err}"
+                )
+        except Exception:
+            pass
+
+    def _cache_geometry(self) -> None:
+        """Cache the display scale and the controlling anchor.
+
+        The scale converts between macOS points and physical pixels: the
+        peer forwards pixel deltas, while deltas captured by the tap are
+        in points. The anchor is the layout center the sprite is re-parked
+        on while controlling.
+        """
+        try:
+            sx, sy = self.cursor_position()
+        except Exception:
+            sx, sy = 0, 0
+        self._scale = self._screen_scale(sx, sy)
+        self._anchor = self._layout_center()
+
+    def _screen_scale(self, x: int, y: int) -> float:
+        """Backing scale factor of the display containing (x, y)."""
+        if NSScreen is None:
+            return 1.0
+        try:
+            for screen in NSScreen.screens():
+                f = screen.frame()
+                if f.origin.x <= x < f.origin.x + f.size.width and f.origin.y <= y < f.origin.y + f.size.height:
+                    return float(screen.backingScaleFactor())
+            return float(NSScreen.mainScreen().backingScaleFactor())
+        except Exception:
+            return 1.0
+
+    def _layout_center(self) -> tuple[int, int]:
+        """Center of the layout union, used as the controlling anchor."""
+        try:
+            layout = self.screen_layout()
+            return (layout.left() + layout.width() // 2, layout.top() + layout.height() // 2)
+        except Exception:
+            return (0, 0)
 
     # -- geometry ---------------------------------------------------------------
 
@@ -452,8 +505,8 @@ class MacInputPlatform:
                     sx, sy = 0, 0
                 self._soft_x, self._soft_y = sx, sy
                 self._soft_valid = True
-            nx = self._soft_x + dx
-            ny = self._soft_y + dy
+            nx = self._soft_x + px_to_pt(dx, self._scale)
+            ny = self._soft_y + px_to_pt(dy, self._scale)
             self._soft_x, self._soft_y = nx, ny
         try:
             layout = self.screen_layout()
